@@ -180,6 +180,86 @@ menu_time_sync() {
     esac
 }
 
+# 检查 BBR 是否已启用
+check_bbr() {
+    local cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    [[ "$cc" == "bbr" ]]
+}
+
+# 获取当前拥塞控制算法
+current_cc() {
+    sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown"
+}
+
+# 获取当前 qdisc
+current_qdisc() {
+    sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown"
+}
+
+enable_bbr() {
+    # 内核是否支持 BBR
+    if ! modprobe tcp_bbr 2>/dev/null && ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        err "当前内核不支持 BBR (需要 Linux 4.9+)"
+        return 1
+    fi
+    msg "写入 sysctl 配置..."
+    # 清掉旧的 BBR 相关配置（防止重复）
+    sed -i '/^net\.core\.default_qdisc/d;/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+    echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
+    echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+    sleep 1
+    if check_bbr; then
+        ok "BBR 已启用"
+        echo -e "  当前算法: ${GREEN}$(current_cc)${NC}    qdisc: ${GREEN}$(current_qdisc)${NC}"
+    else
+        err "BBR 启用失败，请检查内核支持"
+        return 1
+    fi
+}
+
+disable_bbr() {
+    msg "切回默认拥塞控制 (cubic)..."
+    sed -i '/^net\.core\.default_qdisc/d;/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1
+    sleep 1
+    ok "已切回 $(current_cc)"
+}
+
+menu_bbr() {
+    while :; do
+        clear; show_banner
+        sec "BBR 拥塞控制"
+        echo -e "  ${YELLOW}BBR 是 Linux 内核 TCP 拥塞控制算法，对跨境代理线路有显著加速${NC}"
+        echo -e "  ${YELLOW}对 TCP 协议有效 (SS / Reality / Trojan 等)，对 UDP (Hysteria2/TUIC) 无影响${NC}"
+        hr
+        echo -e "  当前拥塞控制算法: ${YELLOW}$(current_cc)${NC}"
+        echo -e "  当前 qdisc:        ${YELLOW}$(current_qdisc)${NC}"
+        echo -e "  可用算法: ${CYAN}$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)${NC}"
+        echo
+        if check_bbr; then
+            echo -e "  ${GREEN}[√] BBR 已启用${NC}"
+        else
+            echo -e "  ${RED}[x] BBR 未启用${NC}"
+        fi
+        hr
+        echo "  1) 启用 BBR"
+        echo "  2) 关闭 BBR (切回 cubic)"
+        echo "  0) 返回上一页"
+        hr
+        local c
+        read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
+        case "$c" in
+            1) enable_bbr; pause ;;
+            2) disable_bbr; pause ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
 install_singbox() {
     local force="${1:-}" channel="${2:-stable}"
     if [[ -x "$SB_BIN" && "$force" != "force" ]]; then
@@ -1589,7 +1669,7 @@ menu_singbox() {
     while :; do
         clear; show_banner
         sec "sing-box 管理"
-        local active="未运行" enabled="未启用" ver time_status
+        local active="未运行" enabled="未启用" ver time_status bbr_status
         systemctl is-active --quiet sing-box && active="${GREEN}运行中${NC}"
         systemctl is-enabled --quiet sing-box 2>/dev/null && enabled="${GREEN}开机自启${NC}"
         ver=$("$SB_BIN" version 2>/dev/null | awk '/version/{print $3; exit}')
@@ -1598,8 +1678,14 @@ menu_singbox() {
         else
             time_status="${RED}未同步${NC}"
         fi
+        if check_bbr; then
+            bbr_status="${GREEN}已启用${NC}"
+        else
+            bbr_status="${RED}未启用${NC}"
+        fi
         echo -e "  状态: ${active}    自启: ${enabled}    版本: ${ver:-未知}"
         echo -e "  时间: ${time_status}    (SS-2022/Reality 等协议要求时间偏差 < 30s)"
+        echo -e "  BBR:  ${bbr_status}    (推荐启用,显著提升跨境线路速度)"
         hr
         echo "  1) 启动 sing-box"
         echo "  2) 停止 sing-box"
@@ -1611,10 +1697,11 @@ menu_singbox() {
         echo "  8) 更新 sing-box 到最新稳定版"
         echo "  9) 切换 / 安装 测试版 (Beta)"
         echo "  t) 时间同步状态 / 一键修复"
+        echo "  b) BBR 拥塞控制 / 一键启用"
         echo "  0) 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-9/t]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-9/t/b]: ${NC}")" c
         case "$c" in
             1) systemctl start sing-box && ok "已启动"; sleep 1 ;;
             2) systemctl stop sing-box && ok "已停止"; sleep 1 ;;
@@ -1631,6 +1718,7 @@ menu_singbox() {
             8) rm -f "$SB_BIN"; install_singbox force stable && restart_sb; pause ;;
             9) rm -f "$SB_BIN"; install_singbox force beta && restart_sb; pause ;;
             t|T) menu_time_sync ;;
+            b|B) menu_bbr ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
         esac
@@ -1818,6 +1906,16 @@ first_install() {
         read -rp "$(echo -e "${CYAN}是否立即修复? [Y/n]: ${NC}")" y
         if [[ ! "$y" =~ ^[Nn]$ ]]; then
             fix_time_sync
+        fi
+    fi
+    # BBR 检查（提升跨境线路速度，可选）
+    if check_bbr; then
+        ok "BBR 已启用"
+    else
+        warn "BBR 未启用，启用后可显著提升 TCP 协议跨境速度"
+        read -rp "$(echo -e "${CYAN}是否立即启用 BBR? [Y/n]: ${NC}")" y
+        if [[ ! "$y" =~ ^[Nn]$ ]]; then
+            enable_bbr
         fi
     fi
     hr
