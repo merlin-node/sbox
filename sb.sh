@@ -1856,6 +1856,8 @@ rebuild_client_config() {
 }
 
 restart_client() {
+    # 确保 systemd 服务单元存在（首次添加出口时可能尚未创建）
+    [[ -f "$SB_CLIENT_SERVICE" ]] || setup_client_service
     if ! "$SB_BIN" check -c "$SB_CLIENT_CONF" 2>/tmp/sb_client_check.err; then
         err "客户端配置校验失败:"
         cat /tmp/sb_client_check.err
