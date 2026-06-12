@@ -1849,7 +1849,7 @@ rebuild_client_config() {
         '{
             log:{level:"warn", output:$log, timestamp:true},
             dns:$dns,
-            inbounds:[{type:"socks", tag:"socks-in", listen:"127.0.0.1", listen_port:$sport}],
+            inbounds:[{type:"mixed", tag:"mixed-in", listen:"127.0.0.1", listen_port:$sport}],
             outbounds:$obs,
             route:{rule_set:$rsets, rules:$rules, final:$final, auto_detect_interface:true}
         }' > "$SB_CLIENT_CONF"
@@ -2235,17 +2235,19 @@ write_cc_alias() {
     cat >> "$rc" <<EOF
 # >>> sb claude-code proxy >>>
 # 敲 cc 即带代理跑 Claude Code（端口由 sb 脚本自动维护，请勿手改）
+# 注意：Claude Code 不支持 socks5 代理，必须用 http 代理；
+# 客户端入口是 mixed 类型，同一端口同时支持 socks5 和 http。
 cc() {
-    ALL_PROXY=socks5://127.0.0.1:${sport} \\
-    HTTPS_PROXY=socks5://127.0.0.1:${sport} \\
-    HTTP_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTPS_PROXY=http://127.0.0.1:${sport} \\
+    HTTP_PROXY=http://127.0.0.1:${sport} \\
+    ALL_PROXY= \\
     claude "\$@"
 }
 # 通用：cx <命令> 让任意命令走本地代理(如 cx codex / cx curl ...)
 cx() {
+    HTTPS_PROXY=http://127.0.0.1:${sport} \\
+    HTTP_PROXY=http://127.0.0.1:${sport} \\
     ALL_PROXY=socks5://127.0.0.1:${sport} \\
-    HTTPS_PROXY=socks5://127.0.0.1:${sport} \\
-    HTTP_PROXY=socks5://127.0.0.1:${sport} \\
     "\$@"
 }
 # <<< sb claude-code proxy <<<
@@ -2266,13 +2268,19 @@ client_test() {
     echo -e "  本机直连出口 IP (final=direct 时未匹配流量走这里):"
     echo -e "    ${YELLOW}$(curl -fsSL -m 8 https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
     echo
-    echo -e "  本地 SOCKS 总入口 ${CYAN}127.0.0.1:${sport}${NC} 出口 IP:"
-    echo -e "    ${GREEN}$(curl -fsSL -m 12 -x socks5://127.0.0.1:${sport} https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
-    echo -e "    ${YELLOW}(注: 这个IP取决于 api.ipify.org 命中了哪条规则/final)${NC}"
+    echo -e "  本地入口 ${CYAN}127.0.0.1:${sport}${NC} (mixed: socks5+http) 出口 IP:"
+    echo -e "    socks5: ${GREEN}$(curl -fsSL -m 12 -x socks5://127.0.0.1:${sport} https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
+    echo -e "    http:   ${GREEN}$(curl -fsSL -m 12 -x http://127.0.0.1:${sport} https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
+    echo -e "    ${YELLOW}(注: ipify 不在分流规则里，默认走 final，IP 可能是本机直连)${NC}"
     hr
-    echo -e "  各出口单独连通(直接测试每个落地是否可用):"
-    local n i; n=$(jq '.outbounds|length' "$SB_CLIENT_META")
-    if (( n==0 )); then echo "    (无出口)"; fi
+    echo -e "  ★ Claude API 可达性 (命中 anthropic 规则，走落地，用 http 入口):"
+    local code
+    code=$(curl -fsSL -m 12 -o /dev/null -w '%{http_code}' -x http://127.0.0.1:${sport} https://api.anthropic.com 2>/dev/null || echo 000)
+    if [[ "$code" =~ ^(200|401|403|404|405)$ ]]; then
+        echo -e "    ${GREEN}可达 (HTTP ${code}) —— Claude Code 能用${NC}"
+    else
+        echo -e "    ${RED}不可达 (HTTP ${code}) —— 检查落地/规则${NC}"
+    fi
     pause
 }
 
