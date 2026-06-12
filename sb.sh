@@ -2253,7 +2253,17 @@ cx() {
 # <<< sb claude-code proxy <<<
 EOF
     ok "已写入 ${rc}"
-    echo -e "  ${CYAN}source ${rc}${NC} 后:  ${GREEN}cc${NC} 跑 Claude Code,  ${GREEN}cx codex${NC} 让 codex 走代理"
+    echo
+    # 说明：sb 是子进程，无法替你正在用的终端 source（这是 shell 的限制，
+    # 任何脚本都做不到）。下面这条命令让“当前已开着的终端”立即生效。
+    echo -e "  ${YELLOW}▶ 让当前终端立即生效，复制执行这一条：${NC}"
+    echo
+    echo -e "      ${BOLD}${CYAN}source ${rc}${NC}"
+    echo
+    echo -e "  ${YELLOW}（只需一次。以后新开终端 / 重新 SSH 登录会自动生效，无需再做）${NC}"
+    echo
+    echo -e "  生效后用法: ${GREEN}cc${NC} 跑 Claude Code   ${GREEN}cx codex${NC} 让 codex 走代理"
+    echo -e "  ${YELLOW}（若敲 cc 提示 command not found，就是还没执行上面那条 source）${NC}"
     pause
 }
 
