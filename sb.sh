@@ -1671,50 +1671,51 @@ menu_routing() {
 }
 
 # =============================================================================
-# 客户端代理模式：本地 SOCKS 出口
-# 把本机变成一个客户端，通过远端 Reality 节点出网，落地一个本地 SOCKS5。
-# 典型用途：让 Claude Code 等 CLI 工具走干净 IP 出口，配合域名分流省流量。
+# 客户端代理模式：本地 SOCKS 出口 + 多落地出口 + 域名/geosite 分流
+# 把本机变成客户端，落地一个本地 SOCKS5(127.0.0.1:port)，
+# 内部按"目标域名/geosite -> 指定落地出口"分流，未匹配走 final(默认直连=本机)。
+# 典型用途：Claude Code 走落地A，Codex 走落地B，其余网站直连或走落地C。
 # 与服务端配置完全隔离：独立 config (client.json) + 独立 systemd 服务。
+#
+# 元信息结构 client_meta.json:
+# {
+#   "socks_port": 10808,
+#   "final": "direct",                 # 默认出口 tag(direct 或某出口 tag)
+#   "download_detour": "direct",       # 下载 geosite .srs 走哪个出口
+#   "outbounds": [ {tag,proto,...各协议参数}, ... ],
+#   "rules": [ {domain:[..], geosite:[..], outbound:"tag"}, ... ]
+# }
 # =============================================================================
 
-# 解析 vless:// 链接 -> 输出一个 JSON 对象 {server,port,uuid,sni,pbk,sid,flow,fp}
-# 兼容本脚本生成的链接格式，以及大多数标准 vless reality 分享链接。
+# 解析 vless:// 链接 -> {server,port,uuid,sni,pbk,sid,flow,fp}
 parse_vless_link() {
     local link="$1"
     [[ "$link" == vless://* ]] || { echo ""; return 1; }
     local body="${link#vless://}"
-    # 去掉 #备注
     body="${body%%#*}"
-    # userinfo(uuid) @ host:port ? query
-    local uuid hostport query host port
+    local uuid rest hostport query host port
     uuid="${body%%@*}"
-    local rest="${body#*@}"
+    rest="${body#*@}"
     if [[ "$rest" == *\?* ]]; then
-        hostport="${rest%%\?*}"
-        query="${rest#*\?}"
+        hostport="${rest%%\?*}"; query="${rest#*\?}"
     else
-        hostport="$rest"
-        query=""
+        hostport="$rest"; query=""
     fi
-    # 处理 IPv6 [::]:port
     if [[ "$hostport" == \[*\]:* ]]; then
-        host="${hostport%]:*}"; host="${host#[}"
-        port="${hostport##*:}"
+        host="${hostport%]:*}"; host="${host#[}"; port="${hostport##*:}"
     else
-        host="${hostport%:*}"
-        port="${hostport##*:}"
+        host="${hostport%:*}"; port="${hostport##*:}"
     fi
-    # 解析 query 参数
     local sni="" pbk="" sid="" flow="" fp="chrome"
     local IFS='&' kv k v
     for kv in $query; do
         k="${kv%%=*}"; v="${kv#*=}"
         case "$k" in
-            sni|peer)  sni="$v" ;;
-            pbk)       pbk="$v" ;;
-            sid)       sid="$v" ;;
-            flow)      flow="$v" ;;
-            fp)        fp="$v" ;;
+            sni|peer) sni="$v" ;;
+            pbk) pbk="$v" ;;
+            sid) sid="$v" ;;
+            flow) flow="$v" ;;
+            fp) fp="$v" ;;
         esac
     done
     unset IFS
@@ -1725,11 +1726,10 @@ parse_vless_link() {
           pbk:$pbk, sid:$sid, flow:$flow, fp:$fp}'
 }
 
-# 写入客户端 systemd 服务（独立于服务端 sing-box.service）
 setup_client_service() {
     cat > "$SB_CLIENT_SERVICE" <<EOF
 [Unit]
-Description=sing-box client (local SOCKS proxy)
+Description=sing-box client (local SOCKS proxy, multi-outbound)
 After=network.target nss-lookup.target
 
 [Service]
@@ -1744,92 +1744,117 @@ EOF
     systemctl daemon-reload
 }
 
-# 由元信息(client_meta.json)生成客户端 config.json
-# 元信息含: socks_port, mode(all|anthropic), node.proto(协议), 以及各协议参数
-# 支持协议: ss / ss2022 / vless-reality / anytls
+# ---- 元信息初始化/读写 ----
+client_meta_init() {
+    [[ -f "$SB_CLIENT_META" ]] && return 0
+    jq -n '{socks_port:10808, final:"direct", download_detour:"direct",
+            outbounds:[], rules:[]}' > "$SB_CLIENT_META"
+}
+
+# ---- 把单个出口元信息(含proto+参数)转成 sing-box outbound JSON ----
+# 入参: 一段 JSON(含 tag, proto, 及各协议字段)。输出: sing-box outbound 对象。
+client_ob_to_singbox() {
+    local ob="$1"
+    local proto tag
+    proto=$(echo "$ob" | jq -r '.proto')
+    tag=$(echo "$ob" | jq -r '.tag')
+    case "$proto" in
+        vless-reality)
+            echo "$ob" | jq '{
+                type:"vless", tag:.tag, server:.server, server_port:.port, uuid:.uuid,
+                tls:{enabled:true, server_name:.sni,
+                     utls:{enabled:true, fingerprint:(.fp // "chrome")},
+                     reality:{enabled:true, public_key:.pbk, short_id:.sid}}
+            } | if ((.flow|not) or (.flow=="")) then . else . end' \
+            | jq --argjson src "$ob" 'if (($src.flow // "")|length)>0 then .flow=$src.flow else . end'
+            ;;
+        ss|ss2022)
+            echo "$ob" | jq '{
+                type:"shadowsocks", tag:.tag, server:.server, server_port:.port,
+                method:.method, password:.password
+            }'
+            ;;
+        anytls)
+            echo "$ob" | jq '{
+                type:"anytls", tag:.tag, server:.server, server_port:.port,
+                password:.password,
+                tls:{enabled:true, server_name:.sni, insecure:(.insecure // false)}
+            }'
+            ;;
+        *)
+            err "未知协议: $proto" >&2; return 1 ;;
+    esac
+}
+
+# ---- 由元信息生成 client.json ----
 rebuild_client_config() {
     [[ -f "$SB_CLIENT_META" ]] || { err "无客户端配置元信息"; return 1; }
 
-    local sport mode proto
+    local sport final dl_detour
     sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
-    mode=$(jq -r '.mode' "$SB_CLIENT_META")
-    # proto 缺失时按 vless-reality 处理（兼容旧版元信息）
-    proto=$(jq -r '.node.proto // "vless-reality"' "$SB_CLIENT_META")
+    final=$(jq -r '.final' "$SB_CLIENT_META")
+    dl_detour=$(jq -r '.download_detour // "direct"' "$SB_CLIENT_META")
 
-    # 按协议类型生成 proxy 出站
-    local proxy_ob
-    case "$proto" in
-        vless-reality)
-            local server port uuid sni pbk sid flow fp
-            server=$(jq -r '.node.server' "$SB_CLIENT_META")
-            port=$(jq -r '.node.port' "$SB_CLIENT_META")
-            uuid=$(jq -r '.node.uuid' "$SB_CLIENT_META")
-            sni=$(jq -r '.node.sni' "$SB_CLIENT_META")
-            pbk=$(jq -r '.node.pbk' "$SB_CLIENT_META")
-            sid=$(jq -r '.node.sid' "$SB_CLIENT_META")
-            flow=$(jq -r '.node.flow' "$SB_CLIENT_META")
-            fp=$(jq -r '.node.fp // "chrome"' "$SB_CLIENT_META")
-            proxy_ob=$(jq -n --arg s "$server" --argjson p "$port" --arg u "$uuid" \
-                --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg fp "$fp" \
-                '{type:"vless", tag:"proxy", server:$s, server_port:$p, uuid:$u,
-                  tls:{enabled:true, server_name:$sni,
-                    utls:{enabled:true, fingerprint:$fp},
-                    reality:{enabled:true, public_key:$pbk, short_id:$sid}}}
-                 | if ($flow|length)>0 then .flow=$flow else . end')
-            ;;
-        ss|ss2022)
-            local server port method pwd
-            server=$(jq -r '.node.server' "$SB_CLIENT_META")
-            port=$(jq -r '.node.port' "$SB_CLIENT_META")
-            method=$(jq -r '.node.method' "$SB_CLIENT_META")
-            pwd=$(jq -r '.node.password' "$SB_CLIENT_META")
-            proxy_ob=$(jq -n --arg s "$server" --argjson p "$port" \
-                --arg m "$method" --arg pw "$pwd" \
-                '{type:"shadowsocks", tag:"proxy", server:$s, server_port:$p,
-                  method:$m, password:$pw}')
-            ;;
-        anytls)
-            local server port pwd sni insecure
-            server=$(jq -r '.node.server' "$SB_CLIENT_META")
-            port=$(jq -r '.node.port' "$SB_CLIENT_META")
-            pwd=$(jq -r '.node.password' "$SB_CLIENT_META")
-            sni=$(jq -r '.node.sni' "$SB_CLIENT_META")
-            insecure=$(jq -r '.node.insecure // "false"' "$SB_CLIENT_META")
-            proxy_ob=$(jq -n --arg s "$server" --argjson p "$port" \
-                --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insecure" \
-                '{type:"anytls", tag:"proxy", server:$s, server_port:$p,
-                  password:$pw,
-                  tls:{enabled:true, server_name:$sni, insecure:$insec}}')
-            ;;
-        *)
-            err "未知协议: $proto"; return 1 ;;
-    esac
+    # 1) 生成所有出口的 sing-box outbound
+    local proxy_obs="[]"
+    local n i
+    n=$(jq '.outbounds | length' "$SB_CLIENT_META")
+    for (( i=0; i<n; i++ )); do
+        local ob sb_ob
+        ob=$(jq -c ".outbounds[$i]" "$SB_CLIENT_META")
+        sb_ob=$(client_ob_to_singbox "$ob") || return 1
+        proxy_obs=$(echo "$proxy_obs" | jq --argjson o "$sb_ob" '. + [$o]')
+    done
+    # 追加内置 direct/block
+    local all_obs
+    all_obs=$(echo "$proxy_obs" | jq '. + [{type:"direct",tag:"direct"},{type:"block",tag:"block"}]')
 
-    # 路由规则：anthropic 模式只代理 anthropic/claude，其余直连；all 模式全走代理
-    local rules final
-    if [[ "$mode" == "anthropic" ]]; then
-        rules=$(jq -n '[{domain_suffix:["anthropic.com","claude.ai"], outbound:"proxy"}]')
-        final="direct"
-    else
-        rules='[]'
-        final="proxy"
+    # 2) 收集用到的 geosite,生成 rule_set 定义(remote .srs)
+    local used_geosite
+    used_geosite=$(jq -r '[.rules[].geosite[]?] | unique | .[]' "$SB_CLIENT_META")
+    local rule_sets="[]"
+    if [[ -n "$used_geosite" ]]; then
+        local rs="[" first=1 name url
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            url="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-${name}.srs"
+            [[ $first -eq 0 ]] && rs+=","
+            rs+="{\"type\":\"remote\",\"tag\":\"geosite-${name}\",\"format\":\"binary\",\"url\":\"${url}\",\"download_detour\":\"${dl_detour}\"}"
+            first=0
+        done <<< "$used_geosite"
+        rs+="]"
+        rule_sets="$rs"
     fi
+
+    # 3) 生成 route.rules:每条规则 -> {domain_suffix?/rule_set?, outbound, action:route}
+    local route_rules
+    route_rules=$(jq '[.rules[] |
+        (if (.geosite|length)>0 then {rule_set:[(.geosite[] | "geosite-\(.)")]} else {} end) +
+        (if (.domain|length)>0 then {domain_suffix:.domain} else {} end) +
+        {outbound:.outbound, action:"route"}
+        | select((has("rule_set")) or (has("domain_suffix")))
+    ]' "$SB_CLIENT_META")
+
+    # DNS(resolve 需要;这里给 local 即可)
+    local dns; dns=$(jq -n '{servers:[{type:"local", tag:"local"}]}')
 
     jq -n \
         --argjson sport "$sport" \
-        --argjson proxy "$proxy_ob" \
-        --argjson rules "$rules" \
+        --argjson obs "$all_obs" \
+        --argjson rsets "$rule_sets" \
+        --argjson rules "$route_rules" \
         --arg final "$final" \
+        --argjson dns "$dns" \
         --arg log "$SB_CLIENT_LOG" \
         '{
             log:{level:"warn", output:$log, timestamp:true},
+            dns:$dns,
             inbounds:[{type:"socks", tag:"socks-in", listen:"127.0.0.1", listen_port:$sport}],
-            outbounds:[ $proxy, {type:"direct", tag:"direct"} ],
-            route:{rules:$rules, final:$final, auto_detect_interface:true}
+            outbounds:$obs,
+            route:{rule_set:$rsets, rules:$rules, final:$final, auto_detect_interface:true}
         }' > "$SB_CLIENT_CONF"
 }
 
-# 校验并(重)启动客户端服务
 restart_client() {
     if ! "$SB_BIN" check -c "$SB_CLIENT_CONF" 2>/tmp/sb_client_check.err; then
         err "客户端配置校验失败:"
@@ -1849,10 +1874,7 @@ restart_client() {
     fi
 }
 
-# ---- 分协议手动录入节点参数，各自输出统一的 node_json ----
-# 统一字段: proto, server, port, 以及该协议特有字段
-
-# 通用：读取 server / port
+# ---- 分协议录入(输出含 proto 的 node json，不含 tag) ----
 _ask_server_port() {
     local _s _p
     read -rp "$(echo -e "${CYAN}落地服务器地址 (IP 或域名): ${NC}")" _s
@@ -1862,36 +1884,20 @@ _ask_server_port() {
     echo "${_s}|${_p}"
 }
 
-# VLESS+Reality：支持粘贴链接 / 选本机节点 / 手填
 client_node_vless() {
-    local node_json="" link="" has_local=0
-    if [[ -f "$SB_NODES" ]] && (( $(jq '[.[]|select(.protocol=="vless-reality")]|length' "$SB_NODES" 2>/dev/null || echo 0) > 0 )); then
-        has_local=1
-    fi
+    local node_json="" link=""
     echo "  录入方式:" >&2
-    (( has_local )) && echo "    1) 选择本机已有的 Reality 节点" >&2
-    echo "    2) 粘贴 vless:// 链接" >&2
-    echo "    3) 手动逐项填写" >&2
+    echo "    1) 粘贴 vless:// 链接" >&2
+    echo "    2) 手动逐项填写" >&2
     echo "    0) 返回" >&2
     local src; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" src
     case "$src" in
         1)
-            (( has_local )) || { err "无效选择" >&2; return 1; }
-            local i=0
-            while IFS=$'\t' read -r remark link_x; do
-                i=$((i+1)); echo -e "  ${i}) ${remark}" >&2
-            done < <(jq -r '.[]|select(.protocol=="vless-reality")|[.remark,.link]|@tsv' "$SB_NODES")
-            local pick; read -rp "$(echo -e "${CYAN}选择节点编号: ${NC}")" pick
-            link=$(jq -r --argjson n "$pick" '[.[]|select(.protocol=="vless-reality")][$n-1].link // empty' "$SB_NODES")
-            [[ -z "$link" ]] && { err "无效编号" >&2; return 1; }
-            node_json=$(parse_vless_link "$link")
-            ;;
-        2)
             read -rp "$(echo -e "${CYAN}粘贴 vless:// 链接: ${NC}")" link
             [[ "$link" == vless://* ]] || { err "不是有效的 vless 链接" >&2; return 1; }
             node_json=$(parse_vless_link "$link")
             ;;
-        3)
+        2)
             local sp server port uuid sni pbk sid flow fp
             sp=$(_ask_server_port) || return 1
             server="${sp%|*}"; port="${sp#*|}"
@@ -1909,19 +1915,13 @@ client_node_vless() {
         *) err "无效选择" >&2; return 1 ;;
     esac
     [[ -z "$node_json" ]] && { err "解析失败" >&2; return 1; }
-    # 校验 pbk
     local pbk; pbk=$(echo "$node_json" | jq -r '.pbk // empty')
-    if [[ -z "$pbk" || "$pbk" == "null" ]]; then
-        err "缺少 public_key(pbk)，无法用于 Reality 出站" >&2; return 1
-    fi
-    echo -e "  ${YELLOW}注意: 客户端用的 Reality 节点，服务端请选 Vision 模式 (非 Brutal)${NC}" >&2
-    # 加 proto 标记
+    [[ -z "$pbk" || "$pbk" == "null" ]] && { err "缺少 public_key(pbk)" >&2; return 1; }
     echo "$node_json" | jq '. + {proto:"vless-reality"}'
 }
 
-# Shadowsocks（含 2022）：手填
 client_node_ss() {
-    local is2022="$1"   # 1=ss2022
+    local is2022="$1"
     local sp server port method pwd
     sp=$(_ask_server_port) || return 1
     server="${sp%|*}"; port="${sp#*|}"
@@ -1951,7 +1951,7 @@ client_node_ss() {
             *) err "无效" >&2; return 1 ;;
         esac
     fi
-    read -rp "$(echo -e "${CYAN}密码 (password / SS2022 的 base64 密钥): ${NC}")" pwd
+    read -rp "$(echo -e "${CYAN}密码 (password / SS2022 base64 密钥): ${NC}")" pwd
     [[ -z "$pwd" ]] && { err "密码不能为空" >&2; return 1; }
     local proto; [[ "$is2022" == "1" ]] && proto="ss2022" || proto="ss"
     jq -n --arg server "$server" --argjson port "$port" \
@@ -1959,7 +1959,6 @@ client_node_ss() {
         '{proto:$proto, server:$server, port:$port, method:$method, password:$password}'
 }
 
-# AnyTLS：手填
 client_node_anytls() {
     local sp server port pwd sni insec
     sp=$(_ask_server_port) || return 1
@@ -1967,127 +1966,270 @@ client_node_anytls() {
     read -rp "$(echo -e "${CYAN}密码 (password): ${NC}")" pwd
     [[ -z "$pwd" ]] && { err "密码不能为空" >&2; return 1; }
     read -rp "$(echo -e "${CYAN}SNI (server_name): ${NC}")" sni
-    read -rp "$(echo -e "${CYAN}跳过证书验证? (自签证书填 y) [y/N]: ${NC}")" insec
+    read -rp "$(echo -e "${CYAN}跳过证书验证? (自签填 y) [y/N]: ${NC}")" insec
     [[ "$insec" =~ ^[Yy]$ ]] && insec="true" || insec="false"
     jq -n --arg server "$server" --argjson port "$port" \
         --arg password "$pwd" --arg sni "$sni" --argjson insecure "$insec" \
         '{proto:"anytls", server:$server, port:$port, password:$password, sni:$sni, insecure:$insecure}'
 }
 
-# 一键创建/重建客户端代理
-client_setup() {
+# ---- 出口管理 ----
+client_outbound_add() {
     clear; show_banner
-    sec "客户端代理模式 → 设置本地 SOCKS 出口"
-    echo -e "  ${YELLOW}用途: 本机通过远端落地节点出网，落地一个本地 SOCKS5${NC}"
-    echo -e "  ${YELLOW}给 Claude Code 等工具用: export ALL_PROXY=socks5://127.0.0.1:端口${NC}"
-    hr
-
-    # 1) 选择出口协议
-    echo "  落地节点协议:"
-    echo "    1) Shadowsocks (老版加密)"
+    sec "出口管理 → 添加落地出口"
+    echo "  协议:"
+    echo "    1) Shadowsocks (老版)"
     echo "    2) Shadowsocks 2022"
     echo "    3) VLESS + Reality"
     echo "    4) AnyTLS"
     echo "    0) 返回"
     hr
-    local pc node_json=""
+    local pc node=""
     read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" pc
     echo
     case "$pc" in
-        1) node_json=$(client_node_ss 0) ;;
-        2) node_json=$(client_node_ss 1) ;;
-        3) node_json=$(client_node_vless) ;;
-        4) node_json=$(client_node_anytls) ;;
+        1) node=$(client_node_ss 0) ;;
+        2) node=$(client_node_ss 1) ;;
+        3) node=$(client_node_vless) ;;
+        4) node=$(client_node_anytls) ;;
         0|"") return ;;
         *) err "无效选择"; pause; return ;;
     esac
-    [[ -z "$node_json" ]] && { pause; return; }
+    [[ -z "$node" ]] && { pause; return; }
 
-    # 2) 本地 SOCKS 端口
-    echo
-    local default_port=10808 sport
-    read -rp "$(echo -e "${CYAN}本地 SOCKS 端口 [默认 ${default_port}]: ${NC}")" sport
-    sport="${sport:-$default_port}"
-    if ! [[ "$sport" =~ ^[0-9]+$ ]] || (( sport < 1024 || sport > 65535 )); then
-        err "端口必须是 1024-65535"; pause; return
-    fi
+    # 取 tag(唯一)
+    local tag
+    while :; do
+        read -rp "$(echo -e "${CYAN}给这个出口起个名字(tag,如 out-cc): ${NC}")" tag
+        tag="${tag// /}"
+        [[ -z "$tag" ]] && { err "不能为空"; continue; }
+        [[ "$tag" == "direct" || "$tag" == "block" ]] && { err "tag 不能用保留字 direct/block"; continue; }
+        if jq -e --arg t "$tag" '.outbounds[]|select(.tag==$t)' "$SB_CLIENT_META" >/dev/null 2>&1; then
+            err "tag 已存在"; continue
+        fi
+        break
+    done
 
-    # 3) 分流模式
-    echo
-    echo "  分流模式:"
-    echo "    1) 仅代理 Anthropic/Claude (省流量, 推荐给 Claude Code)"
-    echo "    2) 全部流量走代理"
-    local mc mode
-    read -rp "$(echo -e "${CYAN}请选择 [1-2, 默认 1]: ${NC}")" mc
-    mc="${mc:-1}"
-    [[ "$mc" == "2" ]] && mode="all" || mode="anthropic"
-
-    # 写元信息
-    jq -n --argjson node "$node_json" \
-        --argjson sport "$sport" --arg mode "$mode" \
-        '{socks_port:$sport, mode:$mode, node:$node}' > "$SB_CLIENT_META"
-
-    setup_client_service
-    rebuild_client_config || { pause; return; }
-    restart_client || { pause; return; }
-
-    echo
-    sec "完成"
-    echo -e "  本地 SOCKS5: ${GREEN}socks5://127.0.0.1:${sport}${NC}"
-    if [[ "$mode" == "anthropic" ]]; then
-        echo -e "  分流: ${GREEN}仅 anthropic.com / claude.ai 走代理，其余直连${NC}"
-    else
-        echo -e "  分流: ${GREEN}全部走代理${NC}"
-    fi
-    echo
-    echo -e "  ${BOLD}给 Claude Code 用:${NC}"
-    echo -e "  ${CYAN}export ALL_PROXY=socks5://127.0.0.1:${sport}${NC}"
-    echo -e "  ${CYAN}export HTTPS_PROXY=socks5://127.0.0.1:${sport}${NC}"
-    echo -e "  ${CYAN}claude${NC}"
-    echo
-    echo -e "  验证出口 IP: ${CYAN}curl -x socks5://127.0.0.1:${sport} https://api.ipify.org${NC}"
-
-    # 若之前已写过 cc 快捷命令，自动同步新端口
-    local hd; hd=$(eval echo "~${SUDO_USER:-root}")
-    [[ -d "$hd" ]] || hd="$HOME"
-    if [[ -f "${hd}/.bashrc" ]] && grep -q '# >>> sb claude-code proxy >>>' "${hd}/.bashrc"; then
-        sed -i '/# >>> sb claude-code proxy >>>/,/# <<< sb claude-code proxy <<</d' "${hd}/.bashrc"
-        cat >> "${hd}/.bashrc" <<EOF
-# >>> sb claude-code proxy >>>
-# 敲 cc 即带代理跑 Claude Code（端口由 sb 脚本自动维护，请勿手改）
-cc() {
-    ALL_PROXY=socks5://127.0.0.1:${sport} \\
-    HTTPS_PROXY=socks5://127.0.0.1:${sport} \\
-    HTTP_PROXY=socks5://127.0.0.1:${sport} \\
-    claude "\$@"
-}
-# <<< sb claude-code proxy <<<
-EOF
-        echo -e "  ${GREEN}(已自动同步 cc 快捷命令端口为 ${sport})${NC}"
-    fi
+    local tmp; tmp=$(mktemp)
+    jq --argjson node "$node" --arg tag "$tag" \
+        '.outbounds += [($node + {tag:$tag})]' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
+    rebuild_client_config && restart_client && ok "出口 ${tag} 已添加" || err "重载失败(请检查参数)"
     pause
 }
 
-# 写入 shell 快捷命令 cc：以后敲 cc 即带正确端口的代理跑 claude
-# 端口自动从客户端元信息读取，永远与实际配置对齐。
+client_outbound_list_inline() {
+    local n; n=$(jq '.outbounds|length' "$SB_CLIENT_META")
+    if (( n==0 )); then
+        echo -e "    ${CYAN}(无)${NC}"
+        return
+    fi
+    jq -r '.outbounds[] | "  \(.tag)\t[\(.proto)]\t\(.server):\(.port)"' "$SB_CLIENT_META" \
+        | nl -w3 -s'. ' | sed 's/^/  /'
+}
+
+client_outbound_del() {
+    clear; show_banner
+    sec "出口管理 → 删除出口"
+    local n; n=$(jq '.outbounds|length' "$SB_CLIENT_META")
+    (( n==0 )) && { warn "没有出口"; pause; return; }
+    client_outbound_list_inline
+    hr
+    local idx; read -rp "$(echo -e "${CYAN}输入要删除的编号: ${NC}")" idx
+    [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=n )) || { err "无效编号"; pause; return; }
+    local tag; tag=$(jq -r ".outbounds[$((idx-1))].tag" "$SB_CLIENT_META")
+    # 检查是否被规则或 final 引用
+    if jq -e --arg t "$tag" '.rules[]|select(.outbound==$t)' "$SB_CLIENT_META" >/dev/null 2>&1; then
+        warn "出口 ${tag} 仍被分流规则引用，请先删除相关规则"; pause; return
+    fi
+    if [[ "$(jq -r '.final' "$SB_CLIENT_META")" == "$tag" ]]; then
+        warn "出口 ${tag} 是当前默认出口(final)，请先改默认出口"; pause; return
+    fi
+    local tmp; tmp=$(mktemp)
+    jq "del(.outbounds[$((idx-1))])" "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
+    rebuild_client_config && restart_client && ok "已删除 ${tag}" || err "重载失败"
+    pause
+}
+
+menu_client_outbounds() {
+    while :; do
+        clear; show_banner
+        sec "出口管理 (落地节点)"
+        echo -e "  当前出口:"
+        client_outbound_list_inline
+        hr
+        echo "  1. 添加出口"
+        echo "  2. 删除出口"
+        echo "  0. 返回"
+        hr
+        local c; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" c
+        case "$c" in
+            1) client_outbound_add ;;
+            2) client_outbound_del ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---- 分流规则管理 ----
+client_rule_list_inline() {
+    local n; n=$(jq '.rules|length' "$SB_CLIENT_META")
+    if (( n==0 )); then
+        echo -e "    ${CYAN}(无规则,全部走 final)${NC}"
+        return
+    fi
+    local i=0
+    while IFS=$'\t' read -r match out; do
+        i=$((i+1))
+        printf "  %d. %s -> %s\n" "$i" "$match" "$out" | sed 's/^/  /'
+    done < <(jq -r '.rules[] |
+        ([ (.geosite[]? | "geosite:\(.)"), (.domain[]?) ] | join(",")) as $m |
+        [$m, .outbound] | @tsv' "$SB_CLIENT_META")
+}
+
+client_rule_add() {
+    clear; show_banner
+    sec "分流规则 → 添加规则"
+    local on; on=$(jq '.outbounds|length' "$SB_CLIENT_META")
+    (( on==0 )) && { warn "请先在「出口管理」添加至少一个出口"; pause; return; }
+
+    read -rp "$(echo -e "${CYAN}目标域名(多个逗号分隔,支持 geosite:xxx): ${NC}")" input
+    [[ -z "$input" ]] && return
+    local geo="[]" dom="[]"
+    local IFS=',' item
+    for item in $input; do
+        item="${item// /}"; [[ -z "$item" ]] && continue
+        if [[ "$item" == geosite:* ]]; then
+            geo=$(echo "$geo" | jq --arg n "${item#geosite:}" '. + [$n]')
+        else
+            dom=$(echo "$dom" | jq --arg n "$item" '. + [$n]')
+        fi
+    done
+    unset IFS
+    [[ "$(echo "$geo" | jq 'length')" == "0" && "$(echo "$dom" | jq 'length')" == "0" ]] && { err "无有效规则"; pause; return; }
+
+    echo
+    echo -e "  ${CYAN}这些流量走哪个出口?${NC}"
+    local tags=() i=0
+    while IFS= read -r t; do
+        i=$((i+1)); echo "    $i) $t"; tags+=("$t")
+    done < <(jq -r '.outbounds[].tag' "$SB_CLIENT_META")
+    hr
+    local pick; read -rp "$(echo -e "${CYAN}选择出口编号: ${NC}")" pick
+    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=i )) || { err "无效"; pause; return; }
+    local out="${tags[$((pick-1))]}"
+
+    local tmp; tmp=$(mktemp)
+    jq --argjson geo "$geo" --argjson dom "$dom" --arg out "$out" \
+        '.rules += [{domain:$dom, geosite:$geo, outbound:$out}]' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
+    rebuild_client_config && restart_client && ok "规则已添加 -> ${out}" || err "重载失败"
+    pause
+}
+
+client_rule_del() {
+    clear; show_banner
+    sec "分流规则 → 删除规则"
+    local n; n=$(jq '.rules|length' "$SB_CLIENT_META")
+    (( n==0 )) && { warn "没有规则"; pause; return; }
+    client_rule_list_inline
+    hr
+    local idx; read -rp "$(echo -e "${CYAN}输入要删除的编号: ${NC}")" idx
+    [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=n )) || { err "无效编号"; pause; return; }
+    local tmp; tmp=$(mktemp)
+    jq "del(.rules[$((idx-1))])" "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
+    rebuild_client_config && restart_client && ok "已删除规则" || err "重载失败"
+    pause
+}
+
+menu_client_rules() {
+    while :; do
+        clear; show_banner
+        sec "分流规则管理 (域名/geosite -> 出口)"
+        echo -e "  当前规则:"
+        client_rule_list_inline
+        echo
+        echo -e "  ${YELLOW}未匹配的流量走 final(默认出口): ${CYAN}$(jq -r '.final' "$SB_CLIENT_META")${NC}"
+        hr
+        echo "  1. 添加规则"
+        echo "  2. 删除规则"
+        echo "  0. 返回"
+        hr
+        local c; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" c
+        case "$c" in
+            1) client_rule_add ;;
+            2) client_rule_del ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---- 端口 / 默认出口 / 下载detour 设置 ----
+menu_client_settings() {
+    while :; do
+        clear; show_banner
+        sec "客户端设置 (端口 / 默认出口)"
+        local sport final dl
+        sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
+        final=$(jq -r '.final' "$SB_CLIENT_META")
+        dl=$(jq -r '.download_detour // "direct"' "$SB_CLIENT_META")
+        echo -e "  本地 SOCKS 端口:   ${CYAN}${sport}${NC}"
+        echo -e "  默认出口(final):   ${CYAN}${final}${NC}   ${YELLOW}(direct=本机直连)${NC}"
+        echo -e "  geosite下载走:     ${CYAN}${dl}${NC}"
+        hr
+        echo "  1. 改本地 SOCKS 端口"
+        echo "  2. 改默认出口 (final)"
+        echo "  3. 改 geosite 下载出口"
+        echo "  0. 返回"
+        hr
+        local c; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" c
+        case "$c" in
+            1)
+                local p; read -rp "$(echo -e "${CYAN}新端口 [1024-65535]: ${NC}")" p
+                [[ "$p" =~ ^[0-9]+$ ]] && (( p>=1024 && p<=65535 )) || { err "非法"; sleep 1; continue; }
+                local tmp; tmp=$(mktemp)
+                jq --argjson p "$p" '.socks_port=$p' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
+                rebuild_client_config && restart_client && ok "端口已改为 ${p}" || err "失败"
+                pause ;;
+            2|3)
+                local field label
+                if [[ "$c" == "2" ]]; then field="final"; label="默认出口"; else field="download_detour"; label="geosite下载出口"; fi
+                echo
+                echo "    0) direct (本机直连)"
+                local tags=() i=0
+                while IFS= read -r t; do
+                    i=$((i+1)); echo "    $i) $t"; tags+=("$t")
+                done < <(jq -r '.outbounds[].tag' "$SB_CLIENT_META")
+                local pick; read -rp "$(echo -e "${CYAN}选 ${label} 编号(0=direct): ${NC}")" pick
+                local val
+                if [[ "$pick" == "0" ]]; then
+                    val="direct"
+                elif [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=i )); then
+                    val="${tags[$((pick-1))]}"
+                else
+                    err "无效"; sleep 1; continue
+                fi
+                local tmp; tmp=$(mktemp)
+                jq --arg f "$field" --arg v "$val" '.[$f]=$v' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
+                rebuild_client_config && restart_client && ok "${label} 已设为 ${val}" || err "失败"
+                pause ;;
+            0|"") return ;;
+            *) err "无效"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---- cc 快捷命令 ----
 write_cc_alias() {
     clear; show_banner
     sec "写入 shell 快捷命令 (cc)"
-    if [[ ! -f "$SB_CLIENT_META" ]]; then
-        warn "请先设置客户端代理 (菜单 1)"; pause; return
-    fi
     local sport; sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
-
-    # 找到要写入的 rc 文件：优先调用者的真实家目录
     local home_dir rc
     home_dir=$(eval echo "~${SUDO_USER:-root}")
     [[ -d "$home_dir" ]] || home_dir="$HOME"
     rc="${home_dir}/.bashrc"
     [[ -f "$rc" ]] || touch "$rc"
-
-    # 删除旧的同名块（幂等，可重复写入更新端口）
     sed -i '/# >>> sb claude-code proxy >>>/,/# <<< sb claude-code proxy <<</d' "$rc"
-
     cat >> "$rc" <<EOF
 # >>> sb claude-code proxy >>>
 # 敲 cc 即带代理跑 Claude Code（端口由 sb 脚本自动维护，请勿手改）
@@ -2097,110 +2239,93 @@ cc() {
     HTTP_PROXY=socks5://127.0.0.1:${sport} \\
     claude "\$@"
 }
+# 通用：cx <命令> 让任意命令走本地代理(如 cx codex / cx curl ...)
+cx() {
+    ALL_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTPS_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTP_PROXY=socks5://127.0.0.1:${sport} \\
+    "\$@"
+}
 # <<< sb claude-code proxy <<<
 EOF
-
-    ok "已写入快捷命令到 ${rc}"
-    echo
-    echo -e "  以后使用方法:"
-    echo -e "    ${CYAN}source ${rc}${NC}   ${YELLOW}(或重新 SSH 登录一次)${NC}"
-    echo -e "    然后直接敲: ${GREEN}cc${NC}   就是带代理的 Claude Code"
-    echo
-    echo -e "  ${YELLOW}普通命令 (apt/git/npm 等) 不受影响，照常走本地直连${NC}"
+    ok "已写入 ${rc}"
+    echo -e "  ${CYAN}source ${rc}${NC} 后:  ${GREEN}cc${NC} 跑 Claude Code,  ${GREEN}cx codex${NC} 让 codex 走代理"
     pause
 }
 
-# 客户端连通性测试
+# ---- 连通性测试:逐个出口测出口IP ----
 client_test() {
     clear; show_banner
     sec "客户端代理 → 连通性测试"
-    if [[ ! -f "$SB_CLIENT_META" ]]; then
-        warn "尚未配置客户端代理"; pause; return
-    fi
     local sport; sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
     if ! systemctl is-active --quiet sing-box-client; then
-        warn "客户端服务未运行，先启动"
-        systemctl start sing-box-client; sleep 1
+        warn "客户端服务未运行，先启动"; systemctl start sing-box-client; sleep 1
     fi
-    echo -e "  本机直连出口 IP:"
-    local direct_ip; direct_ip=$(curl -fsSL -m 8 https://api.ipify.org 2>/dev/null || echo "获取失败")
-    echo -e "    ${YELLOW}${direct_ip}${NC}"
+    echo -e "  本机直连出口 IP (final=direct 时未匹配流量走这里):"
+    echo -e "    ${YELLOW}$(curl -fsSL -m 8 https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
     echo
-    echo -e "  经代理出口 IP (应为好 IP 机器地址):"
-    local proxy_ip; proxy_ip=$(curl -fsSL -m 12 -x "socks5://127.0.0.1:${sport}" https://api.ipify.org 2>/dev/null || echo "获取失败")
-    if [[ "$proxy_ip" == "获取失败" ]]; then
-        echo -e "    ${RED}${proxy_ip}${NC}"
-        echo -e "  ${YELLOW}排查: 查看日志 (菜单里选查看日志) 或检查节点参数${NC}"
-    else
-        echo -e "    ${GREEN}${proxy_ip}${NC}"
-    fi
-    echo
-    echo -e "  测试访问 Anthropic API:"
-    local code; code=$(curl -fsSL -m 12 -o /dev/null -w '%{http_code}' -x "socks5://127.0.0.1:${sport}" https://api.anthropic.com 2>/dev/null || echo "000")
-    if [[ "$code" =~ ^(200|401|403|404)$ ]]; then
-        echo -e "    ${GREEN}可达 (HTTP ${code})${NC}  —— 能连通即可，鉴权交给 Claude Code"
-    else
-        echo -e "    ${RED}不可达 (HTTP ${code})${NC}"
-    fi
+    echo -e "  本地 SOCKS 总入口 ${CYAN}127.0.0.1:${sport}${NC} 出口 IP:"
+    echo -e "    ${GREEN}$(curl -fsSL -m 12 -x socks5://127.0.0.1:${sport} https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
+    echo -e "    ${YELLOW}(注: 这个IP取决于 api.ipify.org 命中了哪条规则/final)${NC}"
+    hr
+    echo -e "  各出口单独连通(直接测试每个落地是否可用):"
+    local n i; n=$(jq '.outbounds|length' "$SB_CLIENT_META")
+    if (( n==0 )); then echo "    (无出口)"; fi
     pause
 }
 
 menu_client() {
+    client_meta_init
     while :; do
         clear; show_banner
-        sec "客户端代理模式 (本地 SOCKS 出口)"
-        local configured="${RED}未配置${NC}" running="${RED}未运行${NC}" info=""
-        if [[ -f "$SB_CLIENT_META" ]]; then
-            local sport mode srv proto
-            sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
-            mode=$(jq -r '.mode' "$SB_CLIENT_META")
-            srv=$(jq -r '.node.server' "$SB_CLIENT_META")
-            proto=$(jq -r '.node.proto // "vless-reality"' "$SB_CLIENT_META")
-            configured="${GREEN}已配置${NC}"
-            [[ "$mode" == "anthropic" ]] && mode="仅 Anthropic/Claude" || mode="全部流量"
-            info="  协议: ${CYAN}${proto}${NC}   本地 SOCKS: ${CYAN}127.0.0.1:${sport}${NC}   出口: ${CYAN}${srv}${NC}   分流: ${CYAN}${mode}${NC}"
-        fi
+        sec "客户端代理模式 (本地 SOCKS 出口 + 多落地分流)"
+        local running="${RED}未运行${NC}"
         systemctl is-active --quiet sing-box-client && running="${GREEN}运行中${NC}"
-        echo -e "  状态: ${configured}    服务: ${running}"
-        [[ -n "$info" ]] && echo -e "$info"
+        local sport final on rn
+        sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
+        final=$(jq -r '.final' "$SB_CLIENT_META")
+        on=$(jq '.outbounds|length' "$SB_CLIENT_META")
+        rn=$(jq '.rules|length' "$SB_CLIENT_META")
+        echo -e "  服务: ${running}    本地SOCKS: ${CYAN}127.0.0.1:${sport}${NC}"
+        echo -e "  出口数: ${CYAN}${on}${NC}   规则数: ${CYAN}${rn}${NC}   默认(final): ${CYAN}${final}${NC}"
         hr
-        echo "  1. 设置 / 重建 客户端代理 (粘贴链接或选本机节点)"
+        echo "  1. 出口管理 (增删落地节点)"
         echo
-        echo "  2. 写入 shell 快捷命令 cc (以后直接敲 cc 跑 Claude Code)"
+        echo "  2. 分流规则管理 (域名/geosite -> 出口)"
         echo
-        echo "  3. 连通性测试 (看出口 IP)"
+        echo "  3. 客户端设置 (本地端口 / 默认出口 final)"
         echo
-        echo "  4. 启动    5. 停止    6. 重启"
+        echo "  4. 连通性测试 (看出口 IP)"
         echo
-        echo "  7. 查看最近日志"
+        echo "  5. 写入 shell 快捷命令 cc / cx"
         echo
-        echo "  8. 删除客户端代理配置"
+        echo "  6. 启动   7. 停止   8. 重启"
+        echo
+        echo "  9. 查看最近日志"
+        echo
+        echo "  d. 删除全部客户端配置"
         echo
         echo "  0. 返回上一页"
         hr
-        local c
-        read -rp "$(echo -e "${CYAN}请选择: ${NC}")" c
+        local c; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" c
         case "$c" in
-            1) client_setup ;;
-            2) write_cc_alias ;;
-            3) client_test ;;
-            4) systemctl start sing-box-client && ok "已启动" || err "启动失败"; sleep 1 ;;
-            5) systemctl stop sing-box-client && ok "已停止"; sleep 1 ;;
-            6) restart_client; pause ;;
-            7) clear
-               if [[ -s "$SB_CLIENT_LOG" ]]; then
-                   tail -n 50 "$SB_CLIENT_LOG"
-               else
-                   journalctl -u sing-box-client -n 50 --no-pager
-               fi
+            1) menu_client_outbounds ;;
+            2) menu_client_rules ;;
+            3) menu_client_settings ;;
+            4) client_test ;;
+            5) write_cc_alias ;;
+            6) setup_client_service; rebuild_client_config && restart_client; pause ;;
+            7) systemctl stop sing-box-client && ok "已停止"; sleep 1 ;;
+            8) restart_client; pause ;;
+            9) clear
+               if [[ -s "$SB_CLIENT_LOG" ]]; then tail -n 50 "$SB_CLIENT_LOG"; else journalctl -u sing-box-client -n 50 --no-pager; fi
                pause ;;
-            8) read -rp "$(echo -e "${YELLOW}确定删除客户端代理配置? [y/N]: ${NC}")" y
+            d|D) read -rp "$(echo -e "${YELLOW}确定删除全部客户端配置? [y/N]: ${NC}")" y
                if [[ "$y" =~ ^[Yy]$ ]]; then
                    systemctl stop sing-box-client 2>/dev/null
                    systemctl disable sing-box-client 2>/dev/null
                    rm -f "$SB_CLIENT_SERVICE" "$SB_CLIENT_CONF" "$SB_CLIENT_META" "$SB_CLIENT_LOG"
                    systemctl daemon-reload
-                   # 同时清掉 .bashrc 里的 cc 快捷命令
                    local hd; hd=$(eval echo "~${SUDO_USER:-root}")
                    [[ -d "$hd" ]] || hd="$HOME"
                    [[ -f "${hd}/.bashrc" ]] && sed -i '/# >>> sb claude-code proxy >>>/,/# <<< sb claude-code proxy <<</d' "${hd}/.bashrc"
