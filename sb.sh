@@ -29,6 +29,12 @@ SB_SERVICE="/etc/systemd/system/sing-box.service"
 SB_SCRIPT_PATH="/usr/local/bin/sb"
 SB_LOG="/var/log/sing-box.log"
 
+# ---- 客户端代理模式 (本地 SOCKS 出口，独立于服务端) ----
+SB_CLIENT_CONF="${SB_DIR}/client.json"
+SB_CLIENT_SERVICE="/etc/systemd/system/sing-box-client.service"
+SB_CLIENT_LOG="/var/log/sing-box-client.log"
+SB_CLIENT_META="${SB_DIR}/client_meta.json"
+
 msg()  { echo -e "${GREEN}[*]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
@@ -728,7 +734,34 @@ create_reality() {
     port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
     read -rp "$(echo -e "${CYAN}请输入借用的真实网站域名 (默认 www.microsoft.com): ${NC}")" sni
     sni="${sni:-www.microsoft.com}"
-    remark=$(ask_remark "reality-${port}")
+
+    # 选择传输模式
+    echo
+    echo -e "${BOLD}请选择传输模式:${NC}"
+    echo "  1) Vision (xtls-rprx-vision) —— 兼容性最好,单线程速度受 RTT 限制"
+    echo "  2) Brutal (h2mux + brutal)    —— 单线程接近多线程,远距离 VPS 推荐"
+    echo
+    echo -e "  ${YELLOW}说明: Brutal 模式按设定带宽强制发送,单流也能跑满,平时小流量正常不受影响${NC}"
+    echo -e "  ${YELLOW}注意: 两种模式服务端都兼容,客户端按对应模式配置即可${NC}"
+    local mode_choice mode brutal_up brutal_down
+    read -rp "$(echo -e "${CYAN}请选择 [1-2,默认 1]: ${NC}")" mode_choice
+    mode_choice="${mode_choice:-1}"
+    if [[ "$mode_choice" == "2" ]]; then
+        mode="brutal"
+        echo
+        echo -e "  ${YELLOW}Brutal 参数: 设定值不要超过线路实际能力,否则反而会因丢包变慢${NC}"
+        read -rp "$(echo -e "${CYAN}下行带宽 Mbps (客户端 down,默认 500): ${NC}")" brutal_down
+        brutal_down="${brutal_down:-500}"
+        read -rp "$(echo -e "${CYAN}上行带宽 Mbps (客户端 up,默认 50): ${NC}")" brutal_up
+        brutal_up="${brutal_up:-50}"
+        if ! [[ "$brutal_down" =~ ^[0-9]+$ ]] || ! [[ "$brutal_up" =~ ^[0-9]+$ ]]; then
+            err "带宽必须是整数"; pause; return
+        fi
+    else
+        mode="vision"
+    fi
+
+    remark=$(ask_remark "reality-${mode}-${port}")
     tag="reality-${port}"
 
     local kp pubkey prvkey shortid uuid
@@ -743,31 +776,83 @@ create_reality() {
     [[ -z "$ip" ]] && { err "无法获取 IPv${family} 地址"; pause; return; }
     listen=$(listen_addr "$family")
 
-    local inbound
-    inbound=$(jq -n --arg tag "$tag" --argjson port "$port" \
-        --arg listen "$listen" \
-        --arg uuid "$uuid" --arg sni "$sni" --arg prv "$prvkey" --arg sid "$shortid" \
-        '{type:"vless", tag:$tag, listen:$listen, listen_port:$port,
-          users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
-          tls:{enabled:true, server_name:$sni,
-            reality:{enabled:true,
-              handshake:{server:$sni, server_port:443},
-              private_key:$prv, short_id:[$sid]}}}')
+    # 根据模式生成 inbound:
+    # vision 模式: users 带 flow,链接含 flow 参数
+    # brutal 模式: users 不带 flow,服务端 multiplex.brutal 开启,客户端在 outbound 里配 mux+brutal
+    local inbound link
+    if [[ "$mode" == "brutal" ]]; then
+        # 服务端 multiplex.brutal.enabled 让服务端接受客户端的 brutal 协商;
+        # up_mbps/down_mbps 是服务端视角,即服务端的上行 = 客户端的下行
+        inbound=$(jq -n --arg tag "$tag" --argjson port "$port" \
+            --arg listen "$listen" \
+            --arg uuid "$uuid" --arg sni "$sni" --arg prv "$prvkey" --arg sid "$shortid" \
+            --argjson srv_up "$brutal_down" --argjson srv_down "$brutal_up" \
+            '{type:"vless", tag:$tag, listen:$listen, listen_port:$port,
+              users:[{uuid:$uuid}],
+              multiplex:{enabled:true,
+                brutal:{enabled:true, up_mbps:$srv_up, down_mbps:$srv_down}},
+              tls:{enabled:true, server_name:$sni,
+                reality:{enabled:true,
+                  handshake:{server:$sni, server_port:443},
+                  private_key:$prv, short_id:[$sid]}}}')
+        # 注意: VLESS 标准分享链接无法表达 mux+brutal,客户端必须用 sing-box 完整 JSON 配置
+        # 这里给出基础 vless:// 链接(无 flow),仅供 sing-box 客户端导入后手动补 mux+brutal
+        link="vless://${uuid}@$(ip_for_url "$ip"):${port}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp#$(urlencode "$remark")"
+    else
+        inbound=$(jq -n --arg tag "$tag" --argjson port "$port" \
+            --arg listen "$listen" \
+            --arg uuid "$uuid" --arg sni "$sni" --arg prv "$prvkey" --arg sid "$shortid" \
+            '{type:"vless", tag:$tag, listen:$listen, listen_port:$port,
+              users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
+              tls:{enabled:true, server_name:$sni,
+                reality:{enabled:true,
+                  handshake:{server:$sni, server_port:443},
+                  private_key:$prv, short_id:[$sid]}}}')
+        link="vless://${uuid}@$(ip_for_url "$ip"):${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp#$(urlencode "$remark")"
+    fi
 
-    local link
-    link="vless://${uuid}@$(ip_for_url "$ip"):${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp#$(urlencode "$remark")"
+    # extra 里存 mode 和 brutal 参数,方便后续展示客户端配置
+    local extra
+    if [[ "$mode" == "brutal" ]]; then
+        extra=$(jq -n --argjson ib "$inbound" --arg pbk "$pubkey" --arg sid "$shortid" \
+                --arg uuid "$uuid" --arg sni "$sni" --arg mode "$mode" \
+                --argjson bu "$brutal_up" --argjson bd "$brutal_down" \
+                '{inbound:$ib, public_key:$pbk, short_id:$sid, uuid:$uuid, sni:$sni,
+                  mode:$mode, brutal_up:$bu, brutal_down:$bd}')
+    else
+        extra=$(jq -n --argjson ib "$inbound" --arg pbk "$pubkey" --arg sid "$shortid" \
+                --arg uuid "$uuid" --arg sni "$sni" --arg mode "$mode" \
+                '{inbound:$ib, public_key:$pbk, short_id:$sid, uuid:$uuid, sni:$sni, mode:$mode}')
+    fi
 
-    save_node "$tag" "vless-reality" "$port" "$family" "$remark" "$link" \
-        "$(jq -n --argjson ib "$inbound" --arg pbk "$pubkey" --arg sid "$shortid" \
-                --arg uuid "$uuid" --arg sni "$sni" \
-                '{inbound:$ib, public_key:$pbk, short_id:$sid, uuid:$uuid, sni:$sni}')"
+    save_node "$tag" "vless-reality" "$port" "$family" "$remark" "$link" "$extra"
     rebuild_config
     restart_sb || return
 
     echo
-    ok "节点创建成功: ${remark}"
+    ok "节点创建成功: ${remark}  (模式: ${mode})"
     echo -e "${BOLD}分享链接:${NC}"
     echo -e "${GREEN}${link}${NC}"
+
+    # Brutal 模式需要客户端额外配置,直接生成 sing-box 客户端 JSON outbound
+    if [[ "$mode" == "brutal" ]]; then
+        echo
+        echo -e "${BOLD}${YELLOW}Brutal 模式客户端配置 (sing-box JSON outbound):${NC}"
+        echo -e "${YELLOW}注意: 标准 vless:// 链接不支持 mux+brutal,必须用下方完整 JSON 导入${NC}"
+        echo
+        # 客户端 brutal: up_mbps=客户端上行=服务端下行=brutal_up
+        #               down_mbps=客户端下行=服务端上行=brutal_down
+        jq -n --arg tag "$remark" --arg srv "$(ip_for_url "$ip")" --argjson port "$port" \
+            --arg uuid "$uuid" --arg sni "$sni" --arg pbk "$pubkey" --arg sid "$shortid" \
+            --argjson up "$brutal_up" --argjson down "$brutal_down" \
+            '{type:"vless", tag:$tag, server:$srv, server_port:$port, uuid:$uuid,
+              tls:{enabled:true, server_name:$sni,
+                utls:{enabled:true, fingerprint:"chrome"},
+                reality:{enabled:true, public_key:$pbk, short_id:$sid}},
+              multiplex:{enabled:true, protocol:"h2mux", max_streams:8, padding:true,
+                brutal:{enabled:true, up_mbps:$up, down_mbps:$down}}}'
+    fi
+
     pause
 }
 
@@ -1584,6 +1669,549 @@ menu_routing() {
         esac
     done
 }
+
+# =============================================================================
+# 客户端代理模式：本地 SOCKS 出口
+# 把本机变成一个客户端，通过远端 Reality 节点出网，落地一个本地 SOCKS5。
+# 典型用途：让 Claude Code 等 CLI 工具走干净 IP 出口，配合域名分流省流量。
+# 与服务端配置完全隔离：独立 config (client.json) + 独立 systemd 服务。
+# =============================================================================
+
+# 解析 vless:// 链接 -> 输出一个 JSON 对象 {server,port,uuid,sni,pbk,sid,flow,fp}
+# 兼容本脚本生成的链接格式，以及大多数标准 vless reality 分享链接。
+parse_vless_link() {
+    local link="$1"
+    [[ "$link" == vless://* ]] || { echo ""; return 1; }
+    local body="${link#vless://}"
+    # 去掉 #备注
+    body="${body%%#*}"
+    # userinfo(uuid) @ host:port ? query
+    local uuid hostport query host port
+    uuid="${body%%@*}"
+    local rest="${body#*@}"
+    if [[ "$rest" == *\?* ]]; then
+        hostport="${rest%%\?*}"
+        query="${rest#*\?}"
+    else
+        hostport="$rest"
+        query=""
+    fi
+    # 处理 IPv6 [::]:port
+    if [[ "$hostport" == \[*\]:* ]]; then
+        host="${hostport%]:*}"; host="${host#[}"
+        port="${hostport##*:}"
+    else
+        host="${hostport%:*}"
+        port="${hostport##*:}"
+    fi
+    # 解析 query 参数
+    local sni="" pbk="" sid="" flow="" fp="chrome"
+    local IFS='&' kv k v
+    for kv in $query; do
+        k="${kv%%=*}"; v="${kv#*=}"
+        case "$k" in
+            sni|peer)  sni="$v" ;;
+            pbk)       pbk="$v" ;;
+            sid)       sid="$v" ;;
+            flow)      flow="$v" ;;
+            fp)        fp="$v" ;;
+        esac
+    done
+    unset IFS
+    jq -n --arg server "$host" --arg port "$port" --arg uuid "$uuid" \
+          --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" \
+          --arg flow "$flow" --arg fp "$fp" \
+        '{server:$server, port:($port|tonumber), uuid:$uuid, sni:$sni,
+          pbk:$pbk, sid:$sid, flow:$flow, fp:$fp}'
+}
+
+# 写入客户端 systemd 服务（独立于服务端 sing-box.service）
+setup_client_service() {
+    cat > "$SB_CLIENT_SERVICE" <<EOF
+[Unit]
+Description=sing-box client (local SOCKS proxy)
+After=network.target nss-lookup.target
+
+[Service]
+ExecStart=${SB_BIN} run -c ${SB_CLIENT_CONF}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+# 由元信息(client_meta.json)生成客户端 config.json
+# 元信息含: socks_port, mode(all|anthropic), node.proto(协议), 以及各协议参数
+# 支持协议: ss / ss2022 / vless-reality / anytls
+rebuild_client_config() {
+    [[ -f "$SB_CLIENT_META" ]] || { err "无客户端配置元信息"; return 1; }
+
+    local sport mode proto
+    sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
+    mode=$(jq -r '.mode' "$SB_CLIENT_META")
+    # proto 缺失时按 vless-reality 处理（兼容旧版元信息）
+    proto=$(jq -r '.node.proto // "vless-reality"' "$SB_CLIENT_META")
+
+    # 按协议类型生成 proxy 出站
+    local proxy_ob
+    case "$proto" in
+        vless-reality)
+            local server port uuid sni pbk sid flow fp
+            server=$(jq -r '.node.server' "$SB_CLIENT_META")
+            port=$(jq -r '.node.port' "$SB_CLIENT_META")
+            uuid=$(jq -r '.node.uuid' "$SB_CLIENT_META")
+            sni=$(jq -r '.node.sni' "$SB_CLIENT_META")
+            pbk=$(jq -r '.node.pbk' "$SB_CLIENT_META")
+            sid=$(jq -r '.node.sid' "$SB_CLIENT_META")
+            flow=$(jq -r '.node.flow' "$SB_CLIENT_META")
+            fp=$(jq -r '.node.fp // "chrome"' "$SB_CLIENT_META")
+            proxy_ob=$(jq -n --arg s "$server" --argjson p "$port" --arg u "$uuid" \
+                --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg fp "$fp" \
+                '{type:"vless", tag:"proxy", server:$s, server_port:$p, uuid:$u,
+                  tls:{enabled:true, server_name:$sni,
+                    utls:{enabled:true, fingerprint:$fp},
+                    reality:{enabled:true, public_key:$pbk, short_id:$sid}}}
+                 | if ($flow|length)>0 then .flow=$flow else . end')
+            ;;
+        ss|ss2022)
+            local server port method pwd
+            server=$(jq -r '.node.server' "$SB_CLIENT_META")
+            port=$(jq -r '.node.port' "$SB_CLIENT_META")
+            method=$(jq -r '.node.method' "$SB_CLIENT_META")
+            pwd=$(jq -r '.node.password' "$SB_CLIENT_META")
+            proxy_ob=$(jq -n --arg s "$server" --argjson p "$port" \
+                --arg m "$method" --arg pw "$pwd" \
+                '{type:"shadowsocks", tag:"proxy", server:$s, server_port:$p,
+                  method:$m, password:$pw}')
+            ;;
+        anytls)
+            local server port pwd sni insecure
+            server=$(jq -r '.node.server' "$SB_CLIENT_META")
+            port=$(jq -r '.node.port' "$SB_CLIENT_META")
+            pwd=$(jq -r '.node.password' "$SB_CLIENT_META")
+            sni=$(jq -r '.node.sni' "$SB_CLIENT_META")
+            insecure=$(jq -r '.node.insecure // "false"' "$SB_CLIENT_META")
+            proxy_ob=$(jq -n --arg s "$server" --argjson p "$port" \
+                --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insecure" \
+                '{type:"anytls", tag:"proxy", server:$s, server_port:$p,
+                  password:$pw,
+                  tls:{enabled:true, server_name:$sni, insecure:$insec}}')
+            ;;
+        *)
+            err "未知协议: $proto"; return 1 ;;
+    esac
+
+    # 路由规则：anthropic 模式只代理 anthropic/claude，其余直连；all 模式全走代理
+    local rules final
+    if [[ "$mode" == "anthropic" ]]; then
+        rules=$(jq -n '[{domain_suffix:["anthropic.com","claude.ai"], outbound:"proxy"}]')
+        final="direct"
+    else
+        rules='[]'
+        final="proxy"
+    fi
+
+    jq -n \
+        --argjson sport "$sport" \
+        --argjson proxy "$proxy_ob" \
+        --argjson rules "$rules" \
+        --arg final "$final" \
+        --arg log "$SB_CLIENT_LOG" \
+        '{
+            log:{level:"warn", output:$log, timestamp:true},
+            inbounds:[{type:"socks", tag:"socks-in", listen:"127.0.0.1", listen_port:$sport}],
+            outbounds:[ $proxy, {type:"direct", tag:"direct"} ],
+            route:{rules:$rules, final:$final, auto_detect_interface:true}
+        }' > "$SB_CLIENT_CONF"
+}
+
+# 校验并(重)启动客户端服务
+restart_client() {
+    if ! "$SB_BIN" check -c "$SB_CLIENT_CONF" 2>/tmp/sb_client_check.err; then
+        err "客户端配置校验失败:"
+        cat /tmp/sb_client_check.err
+        return 1
+    fi
+    systemctl enable sing-box-client >/dev/null 2>&1
+    systemctl restart sing-box-client
+    sleep 1
+    if systemctl is-active --quiet sing-box-client; then
+        ok "客户端代理已启动"
+        return 0
+    else
+        err "客户端启动失败:"
+        journalctl -u sing-box-client -n 10 --no-pager | tail -n 10
+        return 1
+    fi
+}
+
+# ---- 分协议手动录入节点参数，各自输出统一的 node_json ----
+# 统一字段: proto, server, port, 以及该协议特有字段
+
+# 通用：读取 server / port
+_ask_server_port() {
+    local _s _p
+    read -rp "$(echo -e "${CYAN}落地服务器地址 (IP 或域名): ${NC}")" _s
+    [[ -z "$_s" ]] && { err "地址不能为空" >&2; return 1; }
+    read -rp "$(echo -e "${CYAN}端口: ${NC}")" _p
+    [[ "$_p" =~ ^[0-9]+$ ]] && (( _p>=1 && _p<=65535 )) || { err "端口非法" >&2; return 1; }
+    echo "${_s}|${_p}"
+}
+
+# VLESS+Reality：支持粘贴链接 / 选本机节点 / 手填
+client_node_vless() {
+    local node_json="" link="" has_local=0
+    if [[ -f "$SB_NODES" ]] && (( $(jq '[.[]|select(.protocol=="vless-reality")]|length' "$SB_NODES" 2>/dev/null || echo 0) > 0 )); then
+        has_local=1
+    fi
+    echo "  录入方式:" >&2
+    (( has_local )) && echo "    1) 选择本机已有的 Reality 节点" >&2
+    echo "    2) 粘贴 vless:// 链接" >&2
+    echo "    3) 手动逐项填写" >&2
+    echo "    0) 返回" >&2
+    local src; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" src
+    case "$src" in
+        1)
+            (( has_local )) || { err "无效选择" >&2; return 1; }
+            local i=0
+            while IFS=$'\t' read -r remark link_x; do
+                i=$((i+1)); echo -e "  ${i}) ${remark}" >&2
+            done < <(jq -r '.[]|select(.protocol=="vless-reality")|[.remark,.link]|@tsv' "$SB_NODES")
+            local pick; read -rp "$(echo -e "${CYAN}选择节点编号: ${NC}")" pick
+            link=$(jq -r --argjson n "$pick" '[.[]|select(.protocol=="vless-reality")][$n-1].link // empty' "$SB_NODES")
+            [[ -z "$link" ]] && { err "无效编号" >&2; return 1; }
+            node_json=$(parse_vless_link "$link")
+            ;;
+        2)
+            read -rp "$(echo -e "${CYAN}粘贴 vless:// 链接: ${NC}")" link
+            [[ "$link" == vless://* ]] || { err "不是有效的 vless 链接" >&2; return 1; }
+            node_json=$(parse_vless_link "$link")
+            ;;
+        3)
+            local sp server port uuid sni pbk sid flow fp
+            sp=$(_ask_server_port) || return 1
+            server="${sp%|*}"; port="${sp#*|}"
+            read -rp "$(echo -e "${CYAN}UUID: ${NC}")" uuid
+            read -rp "$(echo -e "${CYAN}SNI (server_name): ${NC}")" sni
+            read -rp "$(echo -e "${CYAN}public_key (pbk): ${NC}")" pbk
+            read -rp "$(echo -e "${CYAN}short_id (sid, 可空): ${NC}")" sid
+            read -rp "$(echo -e "${CYAN}flow (一般 xtls-rprx-vision, 可空): ${NC}")" flow
+            read -rp "$(echo -e "${CYAN}指纹 fp [默认 chrome]: ${NC}")" fp; fp="${fp:-chrome}"
+            node_json=$(jq -n --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
+                --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg fp "$fp" \
+                '{server:$server, port:$port, uuid:$uuid, sni:$sni, pbk:$pbk, sid:$sid, flow:$flow, fp:$fp}')
+            ;;
+        0|"") return 1 ;;
+        *) err "无效选择" >&2; return 1 ;;
+    esac
+    [[ -z "$node_json" ]] && { err "解析失败" >&2; return 1; }
+    # 校验 pbk
+    local pbk; pbk=$(echo "$node_json" | jq -r '.pbk // empty')
+    if [[ -z "$pbk" || "$pbk" == "null" ]]; then
+        err "缺少 public_key(pbk)，无法用于 Reality 出站" >&2; return 1
+    fi
+    echo -e "  ${YELLOW}注意: 客户端用的 Reality 节点，服务端请选 Vision 模式 (非 Brutal)${NC}" >&2
+    # 加 proto 标记
+    echo "$node_json" | jq '. + {proto:"vless-reality"}'
+}
+
+# Shadowsocks（含 2022）：手填
+client_node_ss() {
+    local is2022="$1"   # 1=ss2022
+    local sp server port method pwd
+    sp=$(_ask_server_port) || return 1
+    server="${sp%|*}"; port="${sp#*|}"
+    echo "  加密方式:" >&2
+    if [[ "$is2022" == "1" ]]; then
+        echo "    1) 2022-blake3-aes-128-gcm" >&2
+        echo "    2) 2022-blake3-aes-256-gcm" >&2
+        echo "    3) 2022-blake3-chacha20-poly1305" >&2
+        local m; read -rp "$(echo -e "${CYAN}选择 [1-3]: ${NC}")" m
+        case "$m" in
+            1) method="2022-blake3-aes-128-gcm" ;;
+            2) method="2022-blake3-aes-256-gcm" ;;
+            3) method="2022-blake3-chacha20-poly1305" ;;
+            *) err "无效" >&2; return 1 ;;
+        esac
+    else
+        echo "    1) aes-128-gcm" >&2
+        echo "    2) aes-256-gcm" >&2
+        echo "    3) chacha20-ietf-poly1305" >&2
+        echo "    4) xchacha20-ietf-poly1305" >&2
+        local m; read -rp "$(echo -e "${CYAN}选择 [1-4]: ${NC}")" m
+        case "$m" in
+            1) method="aes-128-gcm" ;;
+            2) method="aes-256-gcm" ;;
+            3) method="chacha20-ietf-poly1305" ;;
+            4) method="xchacha20-ietf-poly1305" ;;
+            *) err "无效" >&2; return 1 ;;
+        esac
+    fi
+    read -rp "$(echo -e "${CYAN}密码 (password / SS2022 的 base64 密钥): ${NC}")" pwd
+    [[ -z "$pwd" ]] && { err "密码不能为空" >&2; return 1; }
+    local proto; [[ "$is2022" == "1" ]] && proto="ss2022" || proto="ss"
+    jq -n --arg server "$server" --argjson port "$port" \
+        --arg method "$method" --arg password "$pwd" --arg proto "$proto" \
+        '{proto:$proto, server:$server, port:$port, method:$method, password:$password}'
+}
+
+# AnyTLS：手填
+client_node_anytls() {
+    local sp server port pwd sni insec
+    sp=$(_ask_server_port) || return 1
+    server="${sp%|*}"; port="${sp#*|}"
+    read -rp "$(echo -e "${CYAN}密码 (password): ${NC}")" pwd
+    [[ -z "$pwd" ]] && { err "密码不能为空" >&2; return 1; }
+    read -rp "$(echo -e "${CYAN}SNI (server_name): ${NC}")" sni
+    read -rp "$(echo -e "${CYAN}跳过证书验证? (自签证书填 y) [y/N]: ${NC}")" insec
+    [[ "$insec" =~ ^[Yy]$ ]] && insec="true" || insec="false"
+    jq -n --arg server "$server" --argjson port "$port" \
+        --arg password "$pwd" --arg sni "$sni" --argjson insecure "$insec" \
+        '{proto:"anytls", server:$server, port:$port, password:$password, sni:$sni, insecure:$insecure}'
+}
+
+# 一键创建/重建客户端代理
+client_setup() {
+    clear; show_banner
+    sec "客户端代理模式 → 设置本地 SOCKS 出口"
+    echo -e "  ${YELLOW}用途: 本机通过远端落地节点出网，落地一个本地 SOCKS5${NC}"
+    echo -e "  ${YELLOW}给 Claude Code 等工具用: export ALL_PROXY=socks5://127.0.0.1:端口${NC}"
+    hr
+
+    # 1) 选择出口协议
+    echo "  落地节点协议:"
+    echo "    1) Shadowsocks (老版加密)"
+    echo "    2) Shadowsocks 2022"
+    echo "    3) VLESS + Reality"
+    echo "    4) AnyTLS"
+    echo "    0) 返回"
+    hr
+    local pc node_json=""
+    read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" pc
+    echo
+    case "$pc" in
+        1) node_json=$(client_node_ss 0) ;;
+        2) node_json=$(client_node_ss 1) ;;
+        3) node_json=$(client_node_vless) ;;
+        4) node_json=$(client_node_anytls) ;;
+        0|"") return ;;
+        *) err "无效选择"; pause; return ;;
+    esac
+    [[ -z "$node_json" ]] && { pause; return; }
+
+    # 2) 本地 SOCKS 端口
+    echo
+    local default_port=10808 sport
+    read -rp "$(echo -e "${CYAN}本地 SOCKS 端口 [默认 ${default_port}]: ${NC}")" sport
+    sport="${sport:-$default_port}"
+    if ! [[ "$sport" =~ ^[0-9]+$ ]] || (( sport < 1024 || sport > 65535 )); then
+        err "端口必须是 1024-65535"; pause; return
+    fi
+
+    # 3) 分流模式
+    echo
+    echo "  分流模式:"
+    echo "    1) 仅代理 Anthropic/Claude (省流量, 推荐给 Claude Code)"
+    echo "    2) 全部流量走代理"
+    local mc mode
+    read -rp "$(echo -e "${CYAN}请选择 [1-2, 默认 1]: ${NC}")" mc
+    mc="${mc:-1}"
+    [[ "$mc" == "2" ]] && mode="all" || mode="anthropic"
+
+    # 写元信息
+    jq -n --argjson node "$node_json" \
+        --argjson sport "$sport" --arg mode "$mode" \
+        '{socks_port:$sport, mode:$mode, node:$node}' > "$SB_CLIENT_META"
+
+    setup_client_service
+    rebuild_client_config || { pause; return; }
+    restart_client || { pause; return; }
+
+    echo
+    sec "完成"
+    echo -e "  本地 SOCKS5: ${GREEN}socks5://127.0.0.1:${sport}${NC}"
+    if [[ "$mode" == "anthropic" ]]; then
+        echo -e "  分流: ${GREEN}仅 anthropic.com / claude.ai 走代理，其余直连${NC}"
+    else
+        echo -e "  分流: ${GREEN}全部走代理${NC}"
+    fi
+    echo
+    echo -e "  ${BOLD}给 Claude Code 用:${NC}"
+    echo -e "  ${CYAN}export ALL_PROXY=socks5://127.0.0.1:${sport}${NC}"
+    echo -e "  ${CYAN}export HTTPS_PROXY=socks5://127.0.0.1:${sport}${NC}"
+    echo -e "  ${CYAN}claude${NC}"
+    echo
+    echo -e "  验证出口 IP: ${CYAN}curl -x socks5://127.0.0.1:${sport} https://api.ipify.org${NC}"
+
+    # 若之前已写过 cc 快捷命令，自动同步新端口
+    local hd; hd=$(eval echo "~${SUDO_USER:-root}")
+    [[ -d "$hd" ]] || hd="$HOME"
+    if [[ -f "${hd}/.bashrc" ]] && grep -q '# >>> sb claude-code proxy >>>' "${hd}/.bashrc"; then
+        sed -i '/# >>> sb claude-code proxy >>>/,/# <<< sb claude-code proxy <<</d' "${hd}/.bashrc"
+        cat >> "${hd}/.bashrc" <<EOF
+# >>> sb claude-code proxy >>>
+# 敲 cc 即带代理跑 Claude Code（端口由 sb 脚本自动维护，请勿手改）
+cc() {
+    ALL_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTPS_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTP_PROXY=socks5://127.0.0.1:${sport} \\
+    claude "\$@"
+}
+# <<< sb claude-code proxy <<<
+EOF
+        echo -e "  ${GREEN}(已自动同步 cc 快捷命令端口为 ${sport})${NC}"
+    fi
+    pause
+}
+
+# 写入 shell 快捷命令 cc：以后敲 cc 即带正确端口的代理跑 claude
+# 端口自动从客户端元信息读取，永远与实际配置对齐。
+write_cc_alias() {
+    clear; show_banner
+    sec "写入 shell 快捷命令 (cc)"
+    if [[ ! -f "$SB_CLIENT_META" ]]; then
+        warn "请先设置客户端代理 (菜单 1)"; pause; return
+    fi
+    local sport; sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
+
+    # 找到要写入的 rc 文件：优先调用者的真实家目录
+    local home_dir rc
+    home_dir=$(eval echo "~${SUDO_USER:-root}")
+    [[ -d "$home_dir" ]] || home_dir="$HOME"
+    rc="${home_dir}/.bashrc"
+    [[ -f "$rc" ]] || touch "$rc"
+
+    # 删除旧的同名块（幂等，可重复写入更新端口）
+    sed -i '/# >>> sb claude-code proxy >>>/,/# <<< sb claude-code proxy <<</d' "$rc"
+
+    cat >> "$rc" <<EOF
+# >>> sb claude-code proxy >>>
+# 敲 cc 即带代理跑 Claude Code（端口由 sb 脚本自动维护，请勿手改）
+cc() {
+    ALL_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTPS_PROXY=socks5://127.0.0.1:${sport} \\
+    HTTP_PROXY=socks5://127.0.0.1:${sport} \\
+    claude "\$@"
+}
+# <<< sb claude-code proxy <<<
+EOF
+
+    ok "已写入快捷命令到 ${rc}"
+    echo
+    echo -e "  以后使用方法:"
+    echo -e "    ${CYAN}source ${rc}${NC}   ${YELLOW}(或重新 SSH 登录一次)${NC}"
+    echo -e "    然后直接敲: ${GREEN}cc${NC}   就是带代理的 Claude Code"
+    echo
+    echo -e "  ${YELLOW}普通命令 (apt/git/npm 等) 不受影响，照常走本地直连${NC}"
+    pause
+}
+
+# 客户端连通性测试
+client_test() {
+    clear; show_banner
+    sec "客户端代理 → 连通性测试"
+    if [[ ! -f "$SB_CLIENT_META" ]]; then
+        warn "尚未配置客户端代理"; pause; return
+    fi
+    local sport; sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
+    if ! systemctl is-active --quiet sing-box-client; then
+        warn "客户端服务未运行，先启动"
+        systemctl start sing-box-client; sleep 1
+    fi
+    echo -e "  本机直连出口 IP:"
+    local direct_ip; direct_ip=$(curl -fsSL -m 8 https://api.ipify.org 2>/dev/null || echo "获取失败")
+    echo -e "    ${YELLOW}${direct_ip}${NC}"
+    echo
+    echo -e "  经代理出口 IP (应为好 IP 机器地址):"
+    local proxy_ip; proxy_ip=$(curl -fsSL -m 12 -x "socks5://127.0.0.1:${sport}" https://api.ipify.org 2>/dev/null || echo "获取失败")
+    if [[ "$proxy_ip" == "获取失败" ]]; then
+        echo -e "    ${RED}${proxy_ip}${NC}"
+        echo -e "  ${YELLOW}排查: 查看日志 (菜单里选查看日志) 或检查节点参数${NC}"
+    else
+        echo -e "    ${GREEN}${proxy_ip}${NC}"
+    fi
+    echo
+    echo -e "  测试访问 Anthropic API:"
+    local code; code=$(curl -fsSL -m 12 -o /dev/null -w '%{http_code}' -x "socks5://127.0.0.1:${sport}" https://api.anthropic.com 2>/dev/null || echo "000")
+    if [[ "$code" =~ ^(200|401|403|404)$ ]]; then
+        echo -e "    ${GREEN}可达 (HTTP ${code})${NC}  —— 能连通即可，鉴权交给 Claude Code"
+    else
+        echo -e "    ${RED}不可达 (HTTP ${code})${NC}"
+    fi
+    pause
+}
+
+menu_client() {
+    while :; do
+        clear; show_banner
+        sec "客户端代理模式 (本地 SOCKS 出口)"
+        local configured="${RED}未配置${NC}" running="${RED}未运行${NC}" info=""
+        if [[ -f "$SB_CLIENT_META" ]]; then
+            local sport mode srv proto
+            sport=$(jq -r '.socks_port' "$SB_CLIENT_META")
+            mode=$(jq -r '.mode' "$SB_CLIENT_META")
+            srv=$(jq -r '.node.server' "$SB_CLIENT_META")
+            proto=$(jq -r '.node.proto // "vless-reality"' "$SB_CLIENT_META")
+            configured="${GREEN}已配置${NC}"
+            [[ "$mode" == "anthropic" ]] && mode="仅 Anthropic/Claude" || mode="全部流量"
+            info="  协议: ${CYAN}${proto}${NC}   本地 SOCKS: ${CYAN}127.0.0.1:${sport}${NC}   出口: ${CYAN}${srv}${NC}   分流: ${CYAN}${mode}${NC}"
+        fi
+        systemctl is-active --quiet sing-box-client && running="${GREEN}运行中${NC}"
+        echo -e "  状态: ${configured}    服务: ${running}"
+        [[ -n "$info" ]] && echo -e "$info"
+        hr
+        echo "  1. 设置 / 重建 客户端代理 (粘贴链接或选本机节点)"
+        echo
+        echo "  2. 写入 shell 快捷命令 cc (以后直接敲 cc 跑 Claude Code)"
+        echo
+        echo "  3. 连通性测试 (看出口 IP)"
+        echo
+        echo "  4. 启动    5. 停止    6. 重启"
+        echo
+        echo "  7. 查看最近日志"
+        echo
+        echo "  8. 删除客户端代理配置"
+        echo
+        echo "  0. 返回上一页"
+        hr
+        local c
+        read -rp "$(echo -e "${CYAN}请选择: ${NC}")" c
+        case "$c" in
+            1) client_setup ;;
+            2) write_cc_alias ;;
+            3) client_test ;;
+            4) systemctl start sing-box-client && ok "已启动" || err "启动失败"; sleep 1 ;;
+            5) systemctl stop sing-box-client && ok "已停止"; sleep 1 ;;
+            6) restart_client; pause ;;
+            7) clear
+               if [[ -s "$SB_CLIENT_LOG" ]]; then
+                   tail -n 50 "$SB_CLIENT_LOG"
+               else
+                   journalctl -u sing-box-client -n 50 --no-pager
+               fi
+               pause ;;
+            8) read -rp "$(echo -e "${YELLOW}确定删除客户端代理配置? [y/N]: ${NC}")" y
+               if [[ "$y" =~ ^[Yy]$ ]]; then
+                   systemctl stop sing-box-client 2>/dev/null
+                   systemctl disable sing-box-client 2>/dev/null
+                   rm -f "$SB_CLIENT_SERVICE" "$SB_CLIENT_CONF" "$SB_CLIENT_META" "$SB_CLIENT_LOG"
+                   systemctl daemon-reload
+                   # 同时清掉 .bashrc 里的 cc 快捷命令
+                   local hd; hd=$(eval echo "~${SUDO_USER:-root}")
+                   [[ -d "$hd" ]] || hd="$HOME"
+                   [[ -f "${hd}/.bashrc" ]] && sed -i '/# >>> sb claude-code proxy >>>/,/# <<< sb claude-code proxy <<</d' "${hd}/.bashrc"
+                   ok "已删除"
+               fi
+               sleep 1 ;;
+            0|"") return ;;
+            *) err "无效选择"; sleep 1 ;;
+        esac
+    done
+}
 # =============================================================================
 # IP 优先级
 # =============================================================================
@@ -1840,6 +2468,8 @@ main_menu() {
         echo
         echo "  5. 分流规则管理"
         echo
+        echo "  c. 客户端代理模式 (本地 SOCKS 出口)"
+        echo
         echo "  6. IPv4/IPv6 优先级与策略"
         echo
         echo "  7. 配置流量使用情况"
@@ -1852,13 +2482,14 @@ main_menu() {
         echo
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请输入选项 [0-9]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请输入选项 [0-9/c]: ${NC}")" c
         case "$c" in
             1) menu_add ;;
             2) modify_node ;;
             3) view_nodes ;;
             4) delete_node ;;
             5) menu_routing ;;
+            c|C) menu_client ;;
             6) menu_ip_strategy ;;
             7) menu_traffic ;;
             8) menu_singbox ;;
@@ -1926,11 +2557,21 @@ first_install() {
 
 main() {
     need_root
-    if [[ ! -x "$SB_BIN" || ! -f "$SB_CONF" ]]; then
+    if [[ ! -x "$SB_BIN" ]]; then
+        # sing-box 内核都没有：走完整首次安装
         first_install
     else
+        # 内核已存在。可能是：已有服务端 / 仅想当纯客户端。
+        # 不强制要求服务端 config 存在，确保基础设施就绪后直接进菜单。
         [[ -x "$SB_SCRIPT_PATH" ]] || install_cmd
         init_dirs
+        # 服务端 systemd 单元缺失则补上（仅当存在服务端配置时才需要它运行）
+        [[ -f "$SB_SERVICE" ]] || setup_service
+        # 若已有服务端节点但 config 丢失，重建一次
+        if [[ -f "$SB_NODES" ]] && (( $(jq 'length' "$SB_NODES" 2>/dev/null || echo 0) > 0 )) && [[ ! -f "$SB_CONF" ]]; then
+            rebuild_config
+            systemctl restart sing-box 2>/dev/null || true
+        fi
     fi
     main_menu
 }
