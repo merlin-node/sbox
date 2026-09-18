@@ -7,6 +7,7 @@
 - **系统**：Debian 12 / 13（root 运行）
 - **命令**：`sb`
 - **DDNS**：Cloudflare A / AAAA 记录，systemd timer 定时更新
+- **连接地址选择**：新建节点时可明确选择 IPv4、IPv6 或已配置的 DDNS 域名
 
 ## 一键安装
 
@@ -42,7 +43,7 @@ wget -O /usr/local/bin/sb https://raw.githubusercontent.com/merlin-node/sbox/mai
 ## 功能菜单
 
 ```
-1. 添加配置           # 创建入站节点（IPv4/IPv6 → SS / Reality / AnyTLS）
+1. 添加配置           # 选择 IPv4 / IPv6 / DDNS → SS / Reality / AnyTLS
 2. 更改配置           # 改备注、改端口
 3. 查看配置           # 列出所有节点与分享链接
 4. 删除配置
@@ -64,6 +65,7 @@ d. Cloudflare DDNS    # 动态更新 A/AAAA 记录
 - **Cloudflare DDNS**：在主菜单输入 `d` 配置。API Token 需要目标 Zone 的 `Zone / DNS / Edit` 和 `Zone / Zone / Read` 权限；Token 仅保存在服务器 `/etc/sb-cloudflare-ddns/config.json`，文件权限为 `600`。
 - **仅 DNS**：用于 sing-box 节点时，Cloudflare 代理（橙色云）通常应保持关闭，否则非 Cloudflare 支持的协议和端口无法连接。
 - **更新频率**：DDNS 默认启动后 30 秒执行，此后每 5 分钟检测；公网 IP 未变化时不会修改记录。可在 `d → 3` 查看状态及最近日志。
+- **分享链接**：添加节点时选择 `IPv4` 或 `IPv6` 会生成纯 IP 链接；选择 `DDNS 域名` 才会生成域名链接。DDNS 同时包含 A/AAAA 时，脚本会继续询问节点监听 IPv4 还是 IPv6。已经创建的旧节点链接不会自动改写。
 
 ## 作者
 

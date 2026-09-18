@@ -395,6 +395,32 @@ get_ip() {
     echo "$ip"
 }
 
+# 节点分享链接使用的连接地址：按添加节点菜单所选模式返回纯 IP 或 DDNS 域名。
+get_node_address() {
+    local family="$1" address_mode="${2:-ip}" record_type hostname
+    if [[ "$address_mode" != "ddns" ]]; then
+        get_ip "$family"
+        return
+    fi
+
+    if [[ "$family" == "6" ]]; then
+        record_type="AAAA"
+    else
+        record_type="A"
+    fi
+
+    if [[ -r "$CF_DDNS_CONF" ]] \
+        && jq -e --arg t "$record_type" '.record_types | index($t) != null' \
+            "$CF_DDNS_CONF" >/dev/null 2>&1; then
+        hostname=$(jq -r '.hostname // empty' "$CF_DDNS_CONF" 2>/dev/null)
+        if [[ -n "$hostname" ]]; then
+            echo "$hostname"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 ip_for_url() {
     local ip="$1"
     [[ "$ip" == *:* ]] && echo "[${ip}]" || echo "$ip"
@@ -638,9 +664,12 @@ rebuild_config() {
 # =============================================================================
 menu_new_proto() {
     local family="$1"
+    local address_mode="${2:-ip}"
+    local address_label="IPv${family}"
+    [[ "$address_mode" == "ddns" ]] && address_label="DDNS 域名 (监听 IPv${family})"
     while :; do
         clear; show_banner
-        sec "添加节点 → IPv${family} → 选择协议"
+        sec "添加节点 → ${address_label} → 选择协议"
         echo "  1) Shadowsocks (含 2022)"
         echo
         echo "  2) VLESS + Reality"
@@ -652,9 +681,9 @@ menu_new_proto() {
         local c
         read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
         case "$c" in
-            1) menu_ss_method "$family"; return ;;
-            2) create_reality "$family"; return ;;
-            3) create_anytls "$family"; return ;;
+            1) menu_ss_method "$family" "$address_mode"; return ;;
+            2) create_reality "$family" "$address_mode"; return ;;
+            3) create_anytls "$family" "$address_mode"; return ;;
             0|"") return ;;
             *) err "无效选择"; sleep 1 ;;
         esac
@@ -663,6 +692,7 @@ menu_new_proto() {
 
 menu_ss_method() {
     local family="$1"
+    local address_mode="${2:-ip}"
     clear; show_banner
     sec "Shadowsocks → 选择加密方式"
     echo "  1) aes-128-gcm"
@@ -677,13 +707,13 @@ menu_ss_method() {
     local c
     read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" c
     case "$c" in
-        1) create_ss "$family" "aes-128-gcm" 16 ;;
-        2) create_ss "$family" "aes-256-gcm" 32 ;;
-        3) create_ss "$family" "chacha20-ietf-poly1305" 32 ;;
-        4) create_ss "$family" "xchacha20-ietf-poly1305" 32 ;;
-        5) create_ss "$family" "2022-blake3-aes-128-gcm" 16 ;;
-        6) create_ss "$family" "2022-blake3-aes-256-gcm" 32 ;;
-        7) create_ss "$family" "2022-blake3-chacha20-poly1305" 32 ;;
+        1) create_ss "$family" "aes-128-gcm" 16 "$address_mode" ;;
+        2) create_ss "$family" "aes-256-gcm" 32 "$address_mode" ;;
+        3) create_ss "$family" "chacha20-ietf-poly1305" 32 "$address_mode" ;;
+        4) create_ss "$family" "xchacha20-ietf-poly1305" 32 "$address_mode" ;;
+        5) create_ss "$family" "2022-blake3-aes-128-gcm" 16 "$address_mode" ;;
+        6) create_ss "$family" "2022-blake3-aes-256-gcm" 32 "$address_mode" ;;
+        7) create_ss "$family" "2022-blake3-chacha20-poly1305" 32 "$address_mode" ;;
         0|"") return ;;
         *) err "无效选择"; sleep 1 ;;
     esac
@@ -691,6 +721,7 @@ menu_ss_method() {
 
 create_ss() {
     local family="$1" method="$2" keylen="$3"
+    local address_mode="${4:-ip}"
     local is2022=0
     [[ "$method" == 2022-* ]] && is2022=1
 
@@ -707,8 +738,8 @@ create_ss() {
     remark=$(ask_remark "${short_proto}-${port}")
     tag="${short_proto}-${port}"
 
-    ip=$(get_ip "$family")
-    [[ -z "$ip" ]] && { err "无法获取 IPv${family} 地址"; pause; return; }
+    ip=$(get_node_address "$family" "$address_mode")
+    [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
 
     local listen
     listen=$(listen_addr "$family")
@@ -738,6 +769,7 @@ create_ss() {
 
 create_reality() {
     local family="$1"
+    local address_mode="${2:-ip}"
     local port sni remark tag
     port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
     read -rp "$(echo -e "${CYAN}请输入借用的真实网站域名 (默认 www.microsoft.com): ${NC}")" sni
@@ -780,8 +812,8 @@ create_reality() {
     uuid=$(uuidgen)
 
     local ip listen
-    ip=$(get_ip "$family")
-    [[ -z "$ip" ]] && { err "无法获取 IPv${family} 地址"; pause; return; }
+    ip=$(get_node_address "$family" "$address_mode")
+    [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
     listen=$(listen_addr "$family")
 
     # 根据模式生成 inbound:
@@ -866,6 +898,7 @@ create_reality() {
 
 create_anytls() {
     local family="$1"
+    local address_mode="${2:-ip}"
     local port sni remark tag pwd
     port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
 
@@ -896,8 +929,8 @@ create_anytls() {
     pwd=$(openssl rand -base64 16)
 
     local ip listen
-    ip=$(get_ip "$family")
-    [[ -z "$ip" ]] && { err "无法获取 IPv${family} 地址"; pause; return; }
+    ip=$(get_node_address "$family" "$address_mode")
+    [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
     listen=$(listen_addr "$family")
 
     local inbound link
@@ -944,19 +977,64 @@ create_anytls() {
     pause
 }
 
-menu_add() {
+menu_add_ddns() {
+    if [[ ! -r "$CF_DDNS_CONF" ]]; then
+        err "尚未配置 Cloudflare DDNS，请先在主菜单进入 d → 1"
+        pause; return
+    fi
+
+    local hostname has_a=0 has_aaaa=0
+    hostname=$(jq -r '.hostname // empty' "$CF_DDNS_CONF" 2>/dev/null)
+    jq -e '.record_types | index("A") != null' "$CF_DDNS_CONF" >/dev/null 2>&1 && has_a=1
+    jq -e '.record_types | index("AAAA") != null' "$CF_DDNS_CONF" >/dev/null 2>&1 && has_aaaa=1
+    [[ -n "$hostname" ]] || { err "DDNS 配置中没有域名"; pause; return; }
+
+    if (( has_a == 1 && has_aaaa == 0 )); then
+        menu_new_proto "4" "ddns"
+        return
+    elif (( has_a == 0 && has_aaaa == 1 )); then
+        menu_new_proto "6" "ddns"
+        return
+    elif (( has_a == 0 && has_aaaa == 0 )); then
+        err "DDNS 配置中没有 A 或 AAAA 记录类型"
+        pause; return
+    fi
+
     while :; do
         clear; show_banner
-        sec "添加配置 → 选择出口 IP 协议"
-        echo "  1) IPv4"
-        echo "  2) IPv6"
+        sec "DDNS ${hostname} → 选择监听协议"
+        echo -e "  ${YELLOW}该域名同时配置了 A 和 AAAA，请选择节点监听地址族${NC}"
+        echo
+        echo "  1) 监听 IPv4 (A)"
+        echo "  2) 监听 IPv6 (AAAA)"
         echo "  0) 返回上一页"
         hr
         local c
         read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
         case "$c" in
-            1) menu_new_proto "4"; return ;;
-            2) menu_new_proto "6"; return ;;
+            1) menu_new_proto "4" "ddns"; return ;;
+            2) menu_new_proto "6" "ddns"; return ;;
+            0|"") return ;;
+            *) err "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+menu_add() {
+    while :; do
+        clear; show_banner
+        sec "添加配置 → 选择节点连接地址"
+        echo "  1) IPv4 地址"
+        echo "  2) IPv6 地址"
+        echo "  3) DDNS 域名"
+        echo "  0) 返回上一页"
+        hr
+        local c
+        read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
+        case "$c" in
+            1) menu_new_proto "4" "ip"; return ;;
+            2) menu_new_proto "6" "ip"; return ;;
+            3) menu_add_ddns; return ;;
             0|"") return ;;
             *) err "无效选择"; sleep 1 ;;
         esac
