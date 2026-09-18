@@ -1,11 +1,12 @@
 # sbox
 
-一个简洁的 sing-box 管理脚本，支持多种入站/出站协议、分流规则、流量统计。
+一个简洁的 sing-box 管理脚本，支持多种入站/出站协议、分流规则、流量统计和 Cloudflare DDNS。
 
 - **入站协议**：Shadowsocks（含 2022）、VLESS + Reality、AnyTLS（自签 / ACME 真实证书）
 - **出站协议**：SS / VLESS-Reality / VLESS-WS-TLS / Hysteria2 / TUIC / Trojan / AnyTLS / Socks5
 - **系统**：Debian 12 / 13（root 运行）
 - **命令**：`sb`
+- **DDNS**：Cloudflare A / AAAA 记录，systemd timer 定时更新
 
 ## 一键安装
 
@@ -46,6 +47,8 @@ wget -O /usr/local/bin/sb https://raw.githubusercontent.com/merlin-node/sbox/mai
 3. 查看配置           # 列出所有节点与分享链接
 4. 删除配置
 5. 分流规则管理        # 出站节点、域名规则、屏蔽大陆
+c. 客户端代理模式      # 本地 SOCKS/HTTP 出口、多落地分流
+d. Cloudflare DDNS    # 动态更新 A/AAAA 记录
 6. IPv4/IPv6 优先级与策略
 7. 配置流量使用情况     # vnstat 统计
 8. sing-box 管理       # 启停、日志、版本切换、时间同步
@@ -58,6 +61,9 @@ wget -O /usr/local/bin/sb https://raw.githubusercontent.com/merlin-node/sbox/mai
 - **时间同步**：SS-2022 / Reality 等协议要求服务器与客户端时间偏差 < 30 秒，否则客户端连不上。首次安装会自动检测，菜单 `8 → t` 可随时一键修复。
 - **IPv6**：节点会根据创建时选择的 IPv4 / IPv6 自动绑定监听地址，禁用 IPv6 的机器只创建 IPv4 节点即可。
 - **AnyTLS**：建议选择 ACME 真实证书（需要域名解析到本机 + 80 端口可访问），更安全。
+- **Cloudflare DDNS**：在主菜单输入 `d` 配置。API Token 需要目标 Zone 的 `Zone / DNS / Edit` 和 `Zone / Zone / Read` 权限；Token 仅保存在服务器 `/etc/sb-cloudflare-ddns/config.json`，文件权限为 `600`。
+- **仅 DNS**：用于 sing-box 节点时，Cloudflare 代理（橙色云）通常应保持关闭，否则非 Cloudflare 支持的协议和端口无法连接。
+- **更新频率**：DDNS 默认启动后 30 秒执行，此后每 5 分钟检测；公网 IP 未变化时不会修改记录。可在 `d → 3` 查看状态及最近日志。
 
 ## 作者
 

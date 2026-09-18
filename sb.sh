@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Sing-box Script v1.2 By Merlin
+# Sing-box Script v1.3 By Merlin
 # 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS
 # 支持出站: SS / VLESS-Reality / VLESS-WS-TLS / Hysteria2 / TUIC / Trojan / AnyTLS / Socks5
+# 附加功能: Cloudflare DDNS (IPv4/IPv6)
 # 系统:    Debian 12/13
 # 调用:    sb
 # =============================================================================
 
 set -o pipefail
 
-SCRIPT_VERSION="1.2"
+SCRIPT_VERSION="1.3"
 SCRIPT_AUTHOR="Merlin"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/merlin-node/sbox/main/sb.sh"
 
@@ -34,6 +35,13 @@ SB_CLIENT_CONF="${SB_DIR}/client.json"
 SB_CLIENT_SERVICE="/etc/systemd/system/sing-box-client.service"
 SB_CLIENT_LOG="/var/log/sing-box-client.log"
 SB_CLIENT_META="${SB_DIR}/client_meta.json"
+
+# ---- Cloudflare DDNS (独立于 sing-box) ----
+CF_DDNS_DIR="/etc/sb-cloudflare-ddns"
+CF_DDNS_CONF="${CF_DDNS_DIR}/config.json"
+CF_DDNS_BIN="/usr/local/lib/sb-cloudflare-ddns"
+CF_DDNS_SERVICE="/etc/systemd/system/sb-cloudflare-ddns.service"
+CF_DDNS_TIMER="/etc/systemd/system/sb-cloudflare-ddns.timer"
 
 msg()  { echo -e "${GREEN}[*]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
@@ -99,7 +107,7 @@ install_deps() {
     msg "安装依赖..."
     apt-get update -y >/dev/null 2>&1
     apt-get install -y curl wget jq tar openssl ca-certificates \
-        uuid-runtime iproute2 vnstat chrony >/dev/null 2>&1
+        uuid-runtime iproute2 util-linux vnstat chrony >/dev/null 2>&1
     systemctl enable vnstat >/dev/null 2>&1 || true
     systemctl start vnstat >/dev/null 2>&1 || true
     systemctl enable chrony >/dev/null 2>&1 || true
@@ -2358,6 +2366,357 @@ menu_client() {
     done
 }
 # =============================================================================
+# Cloudflare DDNS
+# =============================================================================
+cf_ddns_api() {
+    local token="$1" method="$2" endpoint="$3" data="${4:-}"
+    local body http_code
+    body=$(mktemp)
+    local -a args=(
+        -sS -o "$body" -w '%{http_code}'
+        -X "$method"
+        -H "Authorization: Bearer ${token}"
+        -H "Content-Type: application/json"
+    )
+    [[ -n "$data" ]] && args+=(--data "$data")
+
+    if ! http_code=$(curl "${args[@]}" "https://api.cloudflare.com/client/v4${endpoint}"); then
+        rm -f "$body"
+        err "无法连接 Cloudflare API" >&2
+        return 1
+    fi
+    if [[ ! "$http_code" =~ ^2 ]] || ! jq -e '.success == true' "$body" >/dev/null 2>&1; then
+        err "Cloudflare API 请求失败 (HTTP ${http_code})" >&2
+        jq -r '.errors[]? | "  [\(.code // "-")] \(.message // "未知错误")"' "$body" 2>/dev/null >&2
+        rm -f "$body"
+        return 1
+    fi
+    cat "$body"
+    rm -f "$body"
+}
+
+install_cf_ddns_runner() {
+    install -d -m 700 "$CF_DDNS_DIR"
+    install -d -m 755 "$(dirname "$CF_DDNS_BIN")"
+    cat > "$CF_DDNS_BIN" <<'CF_DDNS_RUNNER'
+#!/usr/bin/env bash
+set -o pipefail
+
+CONF="/etc/sb-cloudflare-ddns/config.json"
+API_BASE="https://api.cloudflare.com/client/v4"
+
+log() { echo "[$(date '+%F %T')] $*"; }
+fail() { log "错误: $*" >&2; exit 1; }
+
+[[ -r "$CONF" ]] || fail "配置文件不存在: ${CONF}"
+command -v curl >/dev/null 2>&1 || fail "缺少 curl"
+command -v jq >/dev/null 2>&1 || fail "缺少 jq"
+command -v flock >/dev/null 2>&1 || fail "缺少 flock (util-linux)"
+
+TOKEN=$(jq -er '.api_token' "$CONF") || fail "配置中缺少 api_token"
+ZONE_ID=$(jq -er '.zone_id' "$CONF") || fail "配置中缺少 zone_id"
+FQDN=$(jq -er '.hostname' "$CONF") || fail "配置中缺少 hostname"
+PROXIED=$(jq -r '.proxied // false' "$CONF")
+
+exec 9>/run/sb-cloudflare-ddns.lock
+flock -n 9 || { log "已有更新任务运行，跳过"; exit 0; }
+
+api() {
+    local method="$1" endpoint="$2" data="${3:-}"
+    local body http_code
+    body=$(mktemp)
+    local -a args=(
+        -sS -o "$body" -w '%{http_code}'
+        -X "$method"
+        -H "Authorization: Bearer ${TOKEN}"
+        -H "Content-Type: application/json"
+    )
+    [[ -n "$data" ]] && args+=(--data "$data")
+    if ! http_code=$(curl "${args[@]}" "${API_BASE}${endpoint}"); then
+        rm -f "$body"
+        return 1
+    fi
+    if [[ ! "$http_code" =~ ^2 ]] || ! jq -e '.success == true' "$body" >/dev/null 2>&1; then
+        log "Cloudflare API 请求失败 (HTTP ${http_code})" >&2
+        jq -r '.errors[]? | "[\(.code // "-")] \(.message // "未知错误")"' "$body" >&2
+        rm -f "$body"
+        return 1
+    fi
+    cat "$body"
+    rm -f "$body"
+}
+
+public_ip() {
+    local type="$1" ip=""
+    if [[ "$type" == "A" ]]; then
+        ip=$(curl -fsSL --max-time 10 -4 https://api.ipify.org 2>/dev/null) \
+            || ip=$(curl -fsSL --max-time 10 -4 https://ifconfig.co/ip 2>/dev/null) \
+            || return 1
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    else
+        ip=$(curl -fsSL --max-time 10 -6 https://api64.ipify.org 2>/dev/null) \
+            || ip=$(curl -fsSL --max-time 10 -6 https://ifconfig.co/ip 2>/dev/null) \
+            || return 1
+        [[ "$ip" == *:* ]] || return 1
+    fi
+    printf '%s' "$ip"
+}
+
+update_record() {
+    local type="$1" ip result count record_id old_ip old_proxied payload
+    if ! ip=$(public_ip "$type"); then
+        log "${type}: 未检测到可用公网地址，跳过"
+        return 0
+    fi
+
+    result=$(api GET "/zones/${ZONE_ID}/dns_records?type=${type}&name=${FQDN}") \
+        || return 1
+    count=$(jq '.result | length' <<<"$result")
+    if (( count > 1 )); then
+        log "${type}: 找到多个同名记录，仅更新第一条"
+    fi
+
+    payload=$(jq -nc \
+        --arg type "$type" --arg name "$FQDN" --arg content "$ip" \
+        --argjson proxied "$PROXIED" \
+        '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')
+
+    if (( count == 0 )); then
+        api POST "/zones/${ZONE_ID}/dns_records" "$payload" >/dev/null || return 1
+        log "${type}: 已创建 ${FQDN} -> ${ip}"
+        return 0
+    fi
+
+    record_id=$(jq -r '.result[0].id' <<<"$result")
+    old_ip=$(jq -r '.result[0].content' <<<"$result")
+    old_proxied=$(jq -r '.result[0].proxied // false' <<<"$result")
+    if [[ "$old_ip" == "$ip" && "$old_proxied" == "$PROXIED" ]]; then
+        log "${type}: 地址未变化 (${ip})"
+        return 0
+    fi
+
+    api PUT "/zones/${ZONE_ID}/dns_records/${record_id}" "$payload" >/dev/null || return 1
+    log "${type}: 已更新 ${old_ip} -> ${ip}"
+}
+
+status=0
+while IFS= read -r type; do
+    case "$type" in
+        A|AAAA) update_record "$type" || status=1 ;;
+        *) log "忽略未知记录类型: ${type}" ;;
+    esac
+done < <(jq -r '.record_types[]' "$CONF")
+exit "$status"
+CF_DDNS_RUNNER
+    chmod 700 "$CF_DDNS_BIN"
+}
+
+install_cf_ddns_units() {
+    cat > "$CF_DDNS_SERVICE" <<EOF
+[Unit]
+Description=Cloudflare DDNS updater managed by sb
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CF_DDNS_BIN}
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "$CF_DDNS_TIMER" <<'EOF'
+[Unit]
+Description=Run Cloudflare DDNS updater every 5 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=sb-cloudflare-ddns.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 "$CF_DDNS_SERVICE" "$CF_DDNS_TIMER"
+    systemctl daemon-reload
+}
+
+setup_cf_ddns() {
+    clear; show_banner
+    sec "配置 Cloudflare DDNS"
+    echo -e "  ${YELLOW}Token 权限需要: Zone / DNS / Edit + Zone / Zone / Read${NC}"
+    echo -e "  ${YELLOW}Token 只保存在本机 ${CF_DDNS_CONF} (权限 600)${NC}"
+    hr
+
+    local token hostname zone_name verify zone_result zone_id mode proxied_answer proxied=false old_umask
+    read -rsp "$(echo -e "${CYAN}Cloudflare API Token: ${NC}")" token
+    echo
+    [[ -n "$token" ]] || { err "Token 不能为空"; pause; return; }
+
+    msg "验证 API Token..."
+    verify=$(cf_ddns_api "$token" GET "/user/tokens/verify") || { pause; return; }
+    [[ "$(jq -r '.result.status' <<<"$verify")" == "active" ]] \
+        || { err "Token 当前不是 active 状态"; pause; return; }
+
+    read -rp "$(echo -e "${CYAN}DDNS 完整域名 (如 kr.example.com): ${NC}")" hostname
+    hostname="${hostname,,}"; hostname="${hostname%.}"
+    if [[ ! "$hostname" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+        err "域名格式不正确"
+        pause; return
+    fi
+
+    local default_zone
+    default_zone=$(awk -F. '{print $(NF-1)"."$NF}' <<<"$hostname")
+    read -rp "$(echo -e "${CYAN}Cloudflare Zone/根域名 [默认 ${default_zone}]: ${NC}")" zone_name
+    zone_name="${zone_name:-$default_zone}"; zone_name="${zone_name,,}"; zone_name="${zone_name%.}"
+    [[ "$hostname" == "$zone_name" || "$hostname" == *."$zone_name" ]] \
+        || { err "DDNS 域名不属于 Zone ${zone_name}"; pause; return; }
+
+    msg "查找 Cloudflare Zone..."
+    zone_result=$(cf_ddns_api "$token" GET "/zones?name=${zone_name}&status=active&per_page=1") \
+        || { pause; return; }
+    zone_id=$(jq -r '.result[0].id // empty' <<<"$zone_result")
+    [[ -n "$zone_id" ]] || { err "找不到 Zone，请检查根域名及 Token 权限"; pause; return; }
+
+    echo
+    echo "  1) 仅 IPv4 (A)"
+    echo "  2) 仅 IPv6 (AAAA)"
+    echo "  3) IPv4 + IPv6"
+    read -rp "$(echo -e "${CYAN}记录类型 [默认 1]: ${NC}")" mode
+    mode="${mode:-1}"
+    local record_types
+    case "$mode" in
+        1) record_types='["A"]' ;;
+        2) record_types='["AAAA"]' ;;
+        3) record_types='["A","AAAA"]' ;;
+        *) err "无效选择"; pause; return ;;
+    esac
+
+    read -rp "$(echo -e "${CYAN}启用 Cloudflare 代理(橙色云)? [y/N，节点请选 N]: ${NC}")" proxied_answer
+    [[ "$proxied_answer" =~ ^[Yy]$ ]] && proxied=true
+
+    install -d -m 700 "$CF_DDNS_DIR"
+    old_umask=$(umask)
+    umask 077
+    if ! jq -n \
+        --arg token "$token" --arg zone_id "$zone_id" --arg zone_name "$zone_name" \
+        --arg hostname "$hostname" --argjson record_types "$record_types" \
+        --argjson proxied "$proxied" \
+        '{api_token:$token,zone_id:$zone_id,zone_name:$zone_name,hostname:$hostname,record_types:$record_types,proxied:$proxied}' \
+        > "$CF_DDNS_CONF"; then
+        umask "$old_umask"
+        err "写入 DDNS 配置失败"
+        pause; return
+    fi
+    umask "$old_umask"
+    chmod 600 "$CF_DDNS_CONF"
+    token=""
+
+    install_cf_ddns_runner
+    install_cf_ddns_units
+    systemctl enable --now sb-cloudflare-ddns.timer >/dev/null 2>&1
+
+    msg "立即执行首次更新..."
+    if systemctl start sb-cloudflare-ddns.service; then
+        ok "DDNS 已配置: ${hostname}，每 5 分钟检查一次"
+        journalctl -u sb-cloudflare-ddns.service -n 8 --no-pager 2>/dev/null | sed 's/^/  /'
+    else
+        err "首次更新失败，请在 DDNS 菜单查看日志"
+    fi
+    pause
+}
+
+show_cf_ddns_status() {
+    clear; show_banner
+    sec "Cloudflare DDNS 状态"
+    if [[ ! -f "$CF_DDNS_CONF" ]]; then
+        warn "尚未配置 DDNS"
+        pause; return
+    fi
+    echo -e "  域名:     ${CYAN}$(jq -r '.hostname' "$CF_DDNS_CONF")${NC}"
+    echo -e "  Zone:     ${CYAN}$(jq -r '.zone_name' "$CF_DDNS_CONF")${NC}"
+    echo -e "  记录类型: ${CYAN}$(jq -r '.record_types | join(" + ")' "$CF_DDNS_CONF")${NC}"
+    echo -e "  代理状态: ${CYAN}$(jq -r 'if .proxied then "开启" else "关闭（仅 DNS）" end' "$CF_DDNS_CONF")${NC}"
+    echo -e "  定时器:   ${CYAN}$(systemctl is-active sb-cloudflare-ddns.timer 2>/dev/null || true)${NC}"
+    echo
+    systemctl list-timers sb-cloudflare-ddns.timer --no-pager 2>/dev/null | sed 's/^/  /'
+    echo
+    echo -e "  ${YELLOW}最近日志:${NC}"
+    journalctl -u sb-cloudflare-ddns.service -n 10 --no-pager 2>/dev/null | sed 's/^/  /'
+    pause
+}
+
+remove_cf_ddns() {
+    systemctl disable --now sb-cloudflare-ddns.timer >/dev/null 2>&1 || true
+    systemctl stop sb-cloudflare-ddns.service >/dev/null 2>&1 || true
+    rm -f "$CF_DDNS_TIMER" "$CF_DDNS_SERVICE" "$CF_DDNS_BIN"
+    rm -rf "$CF_DDNS_DIR"
+    systemctl daemon-reload
+    ok "Cloudflare DDNS 已卸载"
+}
+
+menu_cf_ddns() {
+    while :; do
+        clear; show_banner
+        sec "Cloudflare DDNS"
+        local configured="${RED}未配置${NC}" timer_status="${RED}未运行${NC}"
+        [[ -f "$CF_DDNS_CONF" ]] && configured="${GREEN}已配置${NC}"
+        systemctl is-active --quiet sb-cloudflare-ddns.timer 2>/dev/null \
+            && timer_status="${GREEN}运行中${NC}"
+        echo -e "  配置: ${configured}    定时器: ${timer_status}"
+        [[ -f "$CF_DDNS_CONF" ]] \
+            && echo -e "  域名: ${CYAN}$(jq -r '.hostname' "$CF_DDNS_CONF")${NC}"
+        hr
+        echo "  1. 配置 / 重新配置"
+        echo "  2. 立即更新"
+        echo "  3. 查看状态"
+        echo "  4. 查看最近日志"
+        echo "  5. 启用定时更新"
+        echo "  6. 停止定时更新"
+        echo "  7. 卸载 DDNS"
+        echo "  0. 返回上一页"
+        hr
+        local c y
+        read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" c
+        case "$c" in
+            1) setup_cf_ddns ;;
+            2)
+                if [[ ! -x "$CF_DDNS_BIN" || ! -f "$CF_DDNS_CONF" ]]; then
+                    err "尚未配置 DDNS"
+                elif systemctl start sb-cloudflare-ddns.service; then
+                    ok "更新完成"
+                    journalctl -u sb-cloudflare-ddns.service -n 8 --no-pager 2>/dev/null
+                else
+                    err "更新失败，请查看日志"
+                fi
+                pause ;;
+            3) show_cf_ddns_status ;;
+            4) clear; journalctl -u sb-cloudflare-ddns.service -n 50 --no-pager 2>/dev/null; pause ;;
+            5)
+                [[ -f "$CF_DDNS_CONF" ]] || { err "请先配置 DDNS"; pause; continue; }
+                install_cf_ddns_runner; install_cf_ddns_units
+                systemctl enable --now sb-cloudflare-ddns.timer >/dev/null 2>&1
+                ok "定时更新已启用"; pause ;;
+            6) systemctl disable --now sb-cloudflare-ddns.timer >/dev/null 2>&1 || true
+               ok "定时更新已停止"; pause ;;
+            7)
+                read -rp "$(echo -e "${YELLOW}确定卸载 DDNS 并删除 Token 配置? [y/N]: ${NC}")" y
+                [[ "$y" =~ ^[Yy]$ ]] && { remove_cf_ddns; pause; } ;;
+            0|"") return ;;
+            *) err "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
 # IP 优先级
 # =============================================================================
 menu_ip_strategy() {
@@ -2550,6 +2909,15 @@ do_uninstall() {
     echo
     read -rp "$(echo -e "${YELLOW}确定卸载? 输入 ${BOLD}YES${NC}${YELLOW} 确认: ${NC}")" y
     [[ "$y" == "YES" ]] || { warn "已取消"; pause; return; }
+    if [[ -f "$CF_DDNS_CONF" || -f "$CF_DDNS_TIMER" ]]; then
+        echo
+        read -rp "$(echo -e "${YELLOW}检测到 Cloudflare DDNS，是否一并卸载并删除 Token? [y/N]: ${NC}")" y
+        if [[ "$y" =~ ^[Yy]$ ]]; then
+            remove_cf_ddns
+        else
+            warn "已保留 Cloudflare DDNS 服务和配置"
+        fi
+    fi
     systemctl stop sing-box 2>/dev/null
     systemctl disable sing-box 2>/dev/null
     rm -f "$SB_SERVICE"
@@ -2615,6 +2983,8 @@ main_menu() {
         echo
         echo "  c. 客户端代理模式 (本地 SOCKS 出口)"
         echo
+        echo "  d. Cloudflare DDNS (动态域名解析)"
+        echo
         echo "  6. IPv4/IPv6 优先级与策略"
         echo
         echo "  7. 配置流量使用情况"
@@ -2627,7 +2997,7 @@ main_menu() {
         echo
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请输入选项 [0-9/c]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请输入选项 [0-9/c/d]: ${NC}")" c
         case "$c" in
             1) menu_add ;;
             2) modify_node ;;
@@ -2635,6 +3005,7 @@ main_menu() {
             4) delete_node ;;
             5) menu_routing ;;
             c|C) menu_client ;;
+            d|D) menu_cf_ddns ;;
             6) menu_ip_strategy ;;
             7) menu_traffic ;;
             8) menu_singbox ;;
