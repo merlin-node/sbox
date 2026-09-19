@@ -2496,7 +2496,10 @@ ZONE_ID=$(jq -er '.zone_id' "$CONF") || fail "配置中缺少 zone_id"
 FQDN=$(jq -er '.hostname' "$CONF") || fail "配置中缺少 hostname"
 PROXIED=$(jq -r '.proxied // false' "$CONF")
 
-exec 9>/run/sb-cloudflare-ddns.lock
+LOCK_DIR="/run/sb-cloudflare-ddns"
+mkdir -p "$LOCK_DIR" || fail "无法创建锁目录: ${LOCK_DIR}"
+chmod 700 "$LOCK_DIR" 2>/dev/null || true
+exec 9>"${LOCK_DIR}/update.lock" || fail "无法创建更新锁"
 flock -n 9 || { log "已有更新任务运行，跳过"; exit 0; }
 
 api() {
@@ -2604,6 +2607,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
+RuntimeDirectory=sb-cloudflare-ddns
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
