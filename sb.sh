@@ -2712,6 +2712,128 @@ setup_cf_ddns() {
     pause
 }
 
+save_cf_ddns_json() {
+    local source_file="$1"
+    if ! jq -e . "$source_file" >/dev/null 2>&1; then
+        err "新的 DDNS 配置不是有效 JSON"
+        rm -f "$source_file"
+        return 1
+    fi
+    install -d -m 700 "$CF_DDNS_DIR"
+    install -m 600 "$source_file" "$CF_DDNS_CONF"
+    rm -f "$source_file"
+}
+
+apply_cf_ddns_changes() {
+    install_cf_ddns_runner
+    install_cf_ddns_units
+    systemctl enable --now sb-cloudflare-ddns.timer >/dev/null 2>&1
+    msg "正在应用配置并立即更新..."
+    if systemctl start sb-cloudflare-ddns.service; then
+        ok "DDNS 配置已更新"
+        journalctl -u sb-cloudflare-ddns.service -n 8 --no-pager 2>/dev/null | sed 's/^/  /'
+    else
+        err "配置已保存，但更新失败，请查看日志"
+    fi
+}
+
+modify_cf_ddns() {
+    [[ -f "$CF_DDNS_CONF" ]] || { err "尚未配置 DDNS，请先新增配置"; pause; return; }
+    while :; do
+        clear; show_banner
+        sec "修改 Cloudflare DDNS 配置"
+        echo -e "  域名:     ${CYAN}$(jq -r '.hostname' "$CF_DDNS_CONF")${NC}"
+        echo -e "  Zone:     ${CYAN}$(jq -r '.zone_name' "$CF_DDNS_CONF")${NC}"
+        echo -e "  记录类型: ${CYAN}$(jq -r '.record_types | join(" + ")' "$CF_DDNS_CONF")${NC}"
+        echo -e "  代理状态: ${CYAN}$(jq -r 'if .proxied then "开启" else "关闭（仅 DNS）" end' "$CF_DDNS_CONF")${NC}"
+        hr
+        echo "  1. 修改域名 / Zone"
+        echo "  2. 修改记录类型 (A / AAAA)"
+        echo "  3. 修改代理状态 (橙色云)"
+        echo "  4. 更换 API Token"
+        echo "  0. 返回上一页"
+        hr
+        local c tmp token hostname zone_name zone_result zone_id mode record_types answer current
+        read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
+        case "$c" in
+            1)
+                token=$(jq -r '.api_token' "$CF_DDNS_CONF")
+                current=$(jq -r '.hostname' "$CF_DDNS_CONF")
+                read -rp "$(echo -e "${CYAN}DDNS 完整域名 [当前 ${current}]: ${NC}")" hostname
+                hostname="${hostname:-$current}"; hostname="${hostname,,}"; hostname="${hostname%.}"
+                if [[ ! "$hostname" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+                    err "域名格式不正确"; pause; continue
+                fi
+                current=$(jq -r '.zone_name' "$CF_DDNS_CONF")
+                read -rp "$(echo -e "${CYAN}Cloudflare Zone/根域名 [当前 ${current}]: ${NC}")" zone_name
+                zone_name="${zone_name:-$current}"; zone_name="${zone_name,,}"; zone_name="${zone_name%.}"
+                [[ "$hostname" == "$zone_name" || "$hostname" == *."$zone_name" ]] \
+                    || { err "DDNS 域名不属于 Zone ${zone_name}"; pause; continue; }
+                msg "验证 Zone..."
+                zone_result=$(cf_ddns_api "$token" GET "/zones?name=${zone_name}&status=active&per_page=1") \
+                    || { pause; continue; }
+                zone_id=$(jq -r '.result[0].id // empty' <<<"$zone_result")
+                [[ -n "$zone_id" ]] || { err "找不到 Zone，请检查域名及 Token 权限"; pause; continue; }
+                tmp=$(mktemp)
+                jq --arg h "$hostname" --arg z "$zone_name" --arg zid "$zone_id" \
+                    '.hostname=$h | .zone_name=$z | .zone_id=$zid' "$CF_DDNS_CONF" > "$tmp" \
+                    && save_cf_ddns_json "$tmp" || { rm -f "$tmp"; pause; continue; }
+                warn "旧域名的 DNS 记录不会自动删除，如不再使用请在 Cloudflare 手动删除"
+                apply_cf_ddns_changes; pause ;;
+            2)
+                echo "  1) 仅 IPv4 (A)"
+                echo "  2) 仅 IPv6 (AAAA)"
+                echo "  3) IPv4 + IPv6"
+                read -rp "$(echo -e "${CYAN}记录类型 [1-3]: ${NC}")" mode
+                case "$mode" in
+                    1) record_types='["A"]' ;;
+                    2) record_types='["AAAA"]' ;;
+                    3) record_types='["A","AAAA"]' ;;
+                    *) err "无效选择"; pause; continue ;;
+                esac
+                tmp=$(mktemp)
+                jq --argjson types "$record_types" '.record_types=$types' "$CF_DDNS_CONF" > "$tmp" \
+                    && save_cf_ddns_json "$tmp" || { rm -f "$tmp"; pause; continue; }
+                apply_cf_ddns_changes; pause ;;
+            3)
+                current=$(jq -r '.proxied // false' "$CF_DDNS_CONF")
+                if [[ "$current" == "true" ]]; then
+                    read -rp "$(echo -e "${CYAN}启用 Cloudflare 代理? [Y/n，节点建议 n]: ${NC}")" answer
+                    [[ "$answer" =~ ^[Nn]$ ]] && current=false || current=true
+                else
+                    read -rp "$(echo -e "${CYAN}启用 Cloudflare 代理? [y/N，节点建议 N]: ${NC}")" answer
+                    [[ "$answer" =~ ^[Yy]$ ]] && current=true || current=false
+                fi
+                tmp=$(mktemp)
+                jq --argjson p "$current" '.proxied=$p' "$CF_DDNS_CONF" > "$tmp" \
+                    && save_cf_ddns_json "$tmp" || { rm -f "$tmp"; pause; continue; }
+                apply_cf_ddns_changes; pause ;;
+            4)
+                read -rsp "$(echo -e "${CYAN}新的 Cloudflare API Token: ${NC}")" token
+                echo
+                [[ -n "$token" ]] || { err "Token 不能为空"; pause; continue; }
+                msg "验证新的 API Token..."
+                local verify
+                verify=$(cf_ddns_api "$token" GET "/user/tokens/verify") || { pause; continue; }
+                [[ "$(jq -r '.result.status' <<<"$verify")" == "active" ]] \
+                    || { err "Token 当前不是 active 状态"; pause; continue; }
+                zone_name=$(jq -r '.zone_name' "$CF_DDNS_CONF")
+                zone_result=$(cf_ddns_api "$token" GET "/zones?name=${zone_name}&status=active&per_page=1") \
+                    || { pause; continue; }
+                zone_id=$(jq -r '.result[0].id // empty' <<<"$zone_result")
+                [[ -n "$zone_id" ]] || { err "新 Token 无权访问当前 Zone"; pause; continue; }
+                tmp=$(mktemp)
+                jq --arg t "$token" --arg zid "$zone_id" '.api_token=$t | .zone_id=$zid' \
+                    "$CF_DDNS_CONF" > "$tmp" \
+                    && save_cf_ddns_json "$tmp" || { rm -f "$tmp"; pause; continue; }
+                token=""
+                apply_cf_ddns_changes; pause ;;
+            0|"") return ;;
+            *) err "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
 show_cf_ddns_status() {
     clear; show_banner
     sec "Cloudflare DDNS 状态"
@@ -2753,20 +2875,22 @@ menu_cf_ddns() {
         [[ -f "$CF_DDNS_CONF" ]] \
             && echo -e "  域名: ${CYAN}$(jq -r '.hostname' "$CF_DDNS_CONF")${NC}"
         hr
-        echo "  1. 配置 / 重新配置"
-        echo "  2. 立即更新"
-        echo "  3. 查看状态"
-        echo "  4. 查看最近日志"
-        echo "  5. 启用定时更新"
-        echo "  6. 停止定时更新"
-        echo "  7. 卸载 DDNS"
+        echo "  1. 新增 / 重新配置"
+        echo "  2. 修改当前配置"
+        echo "  3. 立即更新"
+        echo "  4. 查看状态"
+        echo "  5. 查看最近日志"
+        echo "  6. 启用定时更新"
+        echo "  7. 停止定时更新"
+        echo "  8. 卸载 DDNS"
         echo "  0. 返回上一页"
         hr
         local c y
-        read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-8]: ${NC}")" c
         case "$c" in
             1) setup_cf_ddns ;;
-            2)
+            2) modify_cf_ddns ;;
+            3)
                 if [[ ! -x "$CF_DDNS_BIN" || ! -f "$CF_DDNS_CONF" ]]; then
                     err "尚未配置 DDNS"
                 elif systemctl start sb-cloudflare-ddns.service; then
@@ -2776,16 +2900,16 @@ menu_cf_ddns() {
                     err "更新失败，请查看日志"
                 fi
                 pause ;;
-            3) show_cf_ddns_status ;;
-            4) clear; journalctl -u sb-cloudflare-ddns.service -n 50 --no-pager 2>/dev/null; pause ;;
-            5)
+            4) show_cf_ddns_status ;;
+            5) clear; journalctl -u sb-cloudflare-ddns.service -n 50 --no-pager 2>/dev/null; pause ;;
+            6)
                 [[ -f "$CF_DDNS_CONF" ]] || { err "请先配置 DDNS"; pause; continue; }
                 install_cf_ddns_runner; install_cf_ddns_units
                 systemctl enable --now sb-cloudflare-ddns.timer >/dev/null 2>&1
                 ok "定时更新已启用"; pause ;;
-            6) systemctl disable --now sb-cloudflare-ddns.timer >/dev/null 2>&1 || true
+            7) systemctl disable --now sb-cloudflare-ddns.timer >/dev/null 2>&1 || true
                ok "定时更新已停止"; pause ;;
-            7)
+            8)
                 read -rp "$(echo -e "${YELLOW}确定卸载 DDNS 并删除 Token 配置? [y/N]: ${NC}")" y
                 [[ "$y" =~ ^[Yy]$ ]] && { remove_cf_ddns; pause; } ;;
             0|"") return ;;

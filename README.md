@@ -62,7 +62,7 @@ d. Cloudflare DDNS    # 动态更新 A/AAAA 记录
 - **时间同步**：SS-2022 / Reality 等协议要求服务器与客户端时间偏差 < 30 秒，否则客户端连不上。首次安装会自动检测，菜单 `8 → t` 可随时一键修复。
 - **IPv6**：节点会根据创建时选择的 IPv4 / IPv6 自动绑定监听地址，禁用 IPv6 的机器只创建 IPv4 节点即可。
 - **AnyTLS**：建议选择 ACME 真实证书（需要域名解析到本机 + 80 端口可访问），更安全。
-- **Cloudflare DDNS**：在主菜单输入 `d` 配置。API Token 需要目标 Zone 的 `Zone / DNS / Edit` 和 `Zone / Zone / Read` 权限；Token 仅保存在服务器 `/etc/sb-cloudflare-ddns/config.json`，文件权限为 `600`。
+- **Cloudflare DDNS**：在主菜单输入 `d` 配置。支持新增/重新配置，也可单独修改域名与 Zone、A/AAAA 类型、代理状态或 API Token。Token 需要目标 Zone 的 `Zone / DNS / Edit` 和 `Zone / Zone / Read` 权限，仅保存在服务器 `/etc/sb-cloudflare-ddns/config.json`，文件权限为 `600`。
 - **仅 DNS**：用于 sing-box 节点时，Cloudflare 代理（橙色云）通常应保持关闭，否则非 Cloudflare 支持的协议和端口无法连接。
 - **更新频率**：DDNS 默认启动后 30 秒执行，此后每 5 分钟检测；公网 IP 未变化时不会修改记录。可在 `d → 3` 查看状态及最近日志。
 - **分享链接**：添加节点时选择 `IPv4` 或 `IPv6` 会生成纯 IP 链接；选择 `DDNS 域名` 才会生成域名链接。DDNS 同时包含 A/AAAA 时，脚本会继续询问节点监听 IPv4 还是 IPv6。已经创建的旧节点链接不会自动改写。
