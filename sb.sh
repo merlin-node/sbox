@@ -395,9 +395,32 @@ get_ip() {
     echo "$ip"
 }
 
+# 从基础 DDNS 名称派生独立地址族名称。
+# 例: kr.example.com -> kr4.example.com / kr6.example.com
+ddns_split_hostname() {
+    local hostname="$1" family="$2" first rest
+    first="${hostname%%.*}"
+    rest="${hostname#*.}"
+    [[ "$family" == "6" ]] \
+        && printf '%s6.%s\n' "$first" "$rest" \
+        || printf '%s4.%s\n' "$first" "$rest"
+}
+
+ddns_record_summary() {
+    local conf="$1"
+    if jq -e '(.record_types | index("A") != null) and (.record_types | index("AAAA") != null)' \
+        "$conf" >/dev/null 2>&1; then
+        echo "IPv4 + IPv6（独立域名）"
+    elif jq -e '.record_types | index("AAAA") != null' "$conf" >/dev/null 2>&1; then
+        echo "IPv6（仅 AAAA）"
+    else
+        echo "IPv4（仅 A）"
+    fi
+}
+
 # 节点分享链接使用的连接地址：按添加节点菜单所选模式返回纯 IP 或 DDNS 域名。
 get_node_address() {
-    local family="$1" address_mode="${2:-ip}" record_type hostname
+    local family="$1" address_mode="${2:-ip}" record_type hostname base dual=0
     if [[ "$address_mode" != "ddns" ]]; then
         get_ip "$family"
         return
@@ -412,7 +435,21 @@ get_node_address() {
     if [[ -r "$CF_DDNS_CONF" ]] \
         && jq -e --arg t "$record_type" '.record_types | index($t) != null' \
             "$CF_DDNS_CONF" >/dev/null 2>&1; then
-        hostname=$(jq -r '.hostname // empty' "$CF_DDNS_CONF" 2>/dev/null)
+        base=$(jq -r '.hostname // empty' "$CF_DDNS_CONF" 2>/dev/null)
+        jq -e '(.record_types | index("A") != null) and (.record_types | index("AAAA") != null)' \
+            "$CF_DDNS_CONF" >/dev/null 2>&1 && dual=1
+        if [[ "$family" == "6" ]]; then
+            hostname=$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF" 2>/dev/null)
+        else
+            hostname=$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF" 2>/dev/null)
+        fi
+        if [[ -z "$hostname" ]]; then
+            if (( dual == 1 )); then
+                hostname=$(ddns_split_hostname "$base" "$family")
+            else
+                hostname="$base"
+            fi
+        fi
         if [[ -n "$hostname" ]]; then
             echo "$hostname"
             return 0
@@ -808,6 +845,11 @@ create_reality() {
     kp=$("$SB_BIN" generate reality-keypair) || { err "生成 keypair 失败"; pause; return; }
     prvkey=$(echo "$kp" | awk -F': *' '/PrivateKey/{print $2}')
     pubkey=$(echo "$kp" | awk -F': *' '/PublicKey/{print $2}')
+    if [[ -z "$prvkey" || -z "$pubkey" ]]; then
+        err "无法从 sing-box 输出中读取 Reality 密钥"
+        echo "$kp"
+        pause; return
+    fi
     shortid=$(openssl rand -hex 4)
     uuid=$(uuidgen)
 
@@ -983,8 +1025,10 @@ menu_add_ddns() {
         pause; return
     fi
 
-    local hostname has_a=0 has_aaaa=0
+    local hostname hostname_v4 hostname_v6 has_a=0 has_aaaa=0
     hostname=$(jq -r '.hostname // empty' "$CF_DDNS_CONF" 2>/dev/null)
+    hostname_v4=$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF" 2>/dev/null)
+    hostname_v6=$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF" 2>/dev/null)
     jq -e '.record_types | index("A") != null' "$CF_DDNS_CONF" >/dev/null 2>&1 && has_a=1
     jq -e '.record_types | index("AAAA") != null' "$CF_DDNS_CONF" >/dev/null 2>&1 && has_aaaa=1
     [[ -n "$hostname" ]] || { err "DDNS 配置中没有域名"; pause; return; }
@@ -1002,8 +1046,9 @@ menu_add_ddns() {
 
     while :; do
         clear; show_banner
-        sec "DDNS ${hostname} → 选择监听协议"
-        echo -e "  ${YELLOW}该域名同时配置了 A 和 AAAA，请选择节点监听地址族${NC}"
+        sec "DDNS → 选择监听协议"
+        echo -e "  IPv4: ${CYAN}${hostname_v4}${NC} (仅 A)"
+        echo -e "  IPv6: ${CYAN}${hostname_v6}${NC} (仅 AAAA)"
         echo
         echo "  1) 监听 IPv4 (A)"
         echo "  2) 监听 IPv6 (AAAA)"
@@ -2493,8 +2538,29 @@ command -v flock >/dev/null 2>&1 || fail "缺少 flock (util-linux)"
 
 TOKEN=$(jq -er '.api_token' "$CONF") || fail "配置中缺少 api_token"
 ZONE_ID=$(jq -er '.zone_id' "$CONF") || fail "配置中缺少 zone_id"
-FQDN=$(jq -er '.hostname' "$CONF") || fail "配置中缺少 hostname"
+BASE_FQDN=$(jq -er '.hostname' "$CONF") || fail "配置中缺少 hostname"
 PROXIED=$(jq -r '.proxied // false' "$CONF")
+
+split_hostname() {
+    local hostname="$1" family="$2" first rest
+    first="${hostname%%.*}"
+    rest="${hostname#*.}"
+    [[ "$family" == "6" ]] \
+        && printf '%s6.%s\n' "$first" "$rest" \
+        || printf '%s4.%s\n' "$first" "$rest"
+}
+
+HAS_A=$(jq -r '(.record_types | index("A") != null)' "$CONF")
+HAS_AAAA=$(jq -r '(.record_types | index("AAAA") != null)' "$CONF")
+FQDN4=$(jq -r '.hostname_v4 // empty' "$CONF")
+FQDN6=$(jq -r '.hostname_v6 // empty' "$CONF")
+if [[ "$HAS_A" == "true" && "$HAS_AAAA" == "true" ]]; then
+    [[ -n "$FQDN4" ]] || FQDN4=$(split_hostname "$BASE_FQDN" 4)
+    [[ -n "$FQDN6" ]] || FQDN6=$(split_hostname "$BASE_FQDN" 6)
+else
+    [[ -n "$FQDN4" ]] || FQDN4="$BASE_FQDN"
+    [[ -n "$FQDN6" ]] || FQDN6="$BASE_FQDN"
+fi
 
 LOCK_DIR="/run/sb-cloudflare-ddns"
 mkdir -p "$LOCK_DIR" || fail "无法创建锁目录: ${LOCK_DIR}"
@@ -2544,13 +2610,13 @@ public_ip() {
 }
 
 update_record() {
-    local type="$1" ip result count record_id old_ip old_proxied payload
+    local type="$1" fqdn="$2" ip result count record_id old_ip old_proxied payload
     if ! ip=$(public_ip "$type"); then
         log "${type}: 未检测到可用公网地址，跳过"
         return 0
     fi
 
-    result=$(api GET "/zones/${ZONE_ID}/dns_records?type=${type}&name=${FQDN}") \
+    result=$(api GET "/zones/${ZONE_ID}/dns_records?type=${type}&name=${fqdn}") \
         || return 1
     count=$(jq '.result | length' <<<"$result")
     if (( count > 1 )); then
@@ -2558,13 +2624,13 @@ update_record() {
     fi
 
     payload=$(jq -nc \
-        --arg type "$type" --arg name "$FQDN" --arg content "$ip" \
+        --arg type "$type" --arg name "$fqdn" --arg content "$ip" \
         --argjson proxied "$PROXIED" \
         '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')
 
     if (( count == 0 )); then
         api POST "/zones/${ZONE_ID}/dns_records" "$payload" >/dev/null || return 1
-        log "${type}: 已创建 ${FQDN} -> ${ip}"
+        log "${type}: 已创建 ${fqdn} -> ${ip}"
         return 0
     fi
 
@@ -2583,7 +2649,8 @@ update_record() {
 status=0
 while IFS= read -r type; do
     case "$type" in
-        A|AAAA) update_record "$type" || status=1 ;;
+        A) update_record "$type" "$FQDN4" || status=1 ;;
+        AAAA) update_record "$type" "$FQDN6" || status=1 ;;
         *) log "忽略未知记录类型: ${type}" ;;
     esac
 done < <(jq -r '.record_types[]' "$CONF")
@@ -2670,16 +2737,14 @@ setup_cf_ddns() {
     [[ -n "$zone_id" ]] || { err "找不到 Zone，请检查根域名及 Token 权限"; pause; return; }
 
     echo
-    echo "  1) 仅 IPv4 (A)"
-    echo "  2) 仅 IPv6 (AAAA)"
-    echo "  3) IPv4 + IPv6"
+    echo "  1) IPv4 DDNS (仅 A)"
+    echo "  2) IPv6 DDNS (仅 AAAA)"
     read -rp "$(echo -e "${CYAN}记录类型 [默认 1]: ${NC}")" mode
     mode="${mode:-1}"
-    local record_types
+    local record_types hostname_v4="" hostname_v6=""
     case "$mode" in
-        1) record_types='["A"]' ;;
-        2) record_types='["AAAA"]' ;;
-        3) record_types='["A","AAAA"]' ;;
+        1) record_types='["A"]'; hostname_v4="$hostname" ;;
+        2) record_types='["AAAA"]'; hostname_v6="$hostname" ;;
         *) err "无效选择"; pause; return ;;
     esac
 
@@ -2691,9 +2756,12 @@ setup_cf_ddns() {
     umask 077
     if ! jq -n \
         --arg token "$token" --arg zone_id "$zone_id" --arg zone_name "$zone_name" \
-        --arg hostname "$hostname" --argjson record_types "$record_types" \
+        --arg hostname "$hostname" --arg hostname_v4 "$hostname_v4" --arg hostname_v6 "$hostname_v6" \
+        --argjson record_types "$record_types" \
         --argjson proxied "$proxied" \
-        '{api_token:$token,zone_id:$zone_id,zone_name:$zone_name,hostname:$hostname,record_types:$record_types,proxied:$proxied}' \
+        '{api_token:$token,zone_id:$zone_id,zone_name:$zone_name,hostname:$hostname,
+          hostname_v4:$hostname_v4,hostname_v6:$hostname_v6,
+          record_types:$record_types,proxied:$proxied}' \
         > "$CF_DDNS_CONF"; then
         umask "$old_umask"
         err "写入 DDNS 配置失败"
@@ -2729,7 +2797,62 @@ save_cf_ddns_json() {
     rm -f "$source_file"
 }
 
+# 兼容旧版同名 A+AAAA 配置：自动迁移为两个独立域名。
+migrate_cf_ddns_split_config() {
+    [[ -f "$CF_DDNS_CONF" ]] || return 0
+    jq -e '(.record_types | index("A") != null) and (.record_types | index("AAAA") != null)' \
+        "$CF_DDNS_CONF" >/dev/null 2>&1 || return 0
+
+    local base h4 h6 tmp
+    base=$(jq -r '.hostname // empty' "$CF_DDNS_CONF")
+    [[ -n "$base" ]] || return 1
+    h4=$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF")
+    h6=$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF")
+    [[ -n "$h4" ]] || h4=$(ddns_split_hostname "$base" 4)
+    [[ -n "$h6" ]] || h6=$(ddns_split_hostname "$base" 6)
+
+    if [[ "$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF")" != "$h4" \
+       || "$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF")" != "$h6" ]]; then
+        tmp=$(mktemp) || return 1
+        jq --arg h4 "$h4" --arg h6 "$h6" \
+            '.hostname_v4=$h4 | .hostname_v6=$h6' "$CF_DDNS_CONF" > "$tmp" \
+            && save_cf_ddns_json "$tmp"
+    fi
+}
+
+# 把旧节点链接中的双记录基础域名改为对应的独立地址族域名。
+migrate_ddns_node_links() {
+    [[ -f "$CF_DDNS_CONF" && -f "$SB_NODES" ]] || return 0
+    jq -e '(.record_types | index("A") != null) and (.record_types | index("AAAA") != null)' \
+        "$CF_DDNS_CONF" >/dev/null 2>&1 || return 0
+
+    local base h4 h6 tmp
+    base=$(jq -r '.hostname // empty' "$CF_DDNS_CONF")
+    h4=$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF")
+    h6=$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF")
+    [[ -n "$base" && -n "$h4" && -n "$h6" ]] || return 1
+
+    tmp=$(mktemp) || return 1
+    if jq --arg base "$base" --arg h4 "$h4" --arg h6 "$h6" '
+        map(
+          if ((.link // "") | contains("@" + $base + ":")) then
+            (.link | split("@")) as $parts |
+            ($parts[1] | index(":")) as $colon |
+            .link = ($parts[0] + "@" +
+                     (if .family == "6" then $h6 else $h4 end) +
+                     ($parts[1] | .[$colon:]))
+          else . end
+        )
+    ' "$SB_NODES" > "$tmp"; then
+        mv "$tmp" "$SB_NODES"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
 apply_cf_ddns_changes() {
+    migrate_cf_ddns_split_config || { err "DDNS 独立域名迁移失败"; return 1; }
     install_cf_ddns_runner
     install_cf_ddns_units
     systemctl enable --now sb-cloudflare-ddns.timer >/dev/null 2>&1
@@ -2748,8 +2871,12 @@ modify_cf_ddns() {
         clear; show_banner
         sec "修改 Cloudflare DDNS 配置"
         echo -e "  域名:     ${CYAN}$(jq -r '.hostname' "$CF_DDNS_CONF")${NC}"
+        [[ -n "$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF")" ]] \
+            && echo -e "  IPv4 域名:${CYAN} $(jq -r '.hostname_v4' "$CF_DDNS_CONF")${NC}"
+        [[ -n "$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF")" ]] \
+            && echo -e "  IPv6 域名:${CYAN} $(jq -r '.hostname_v6' "$CF_DDNS_CONF")${NC}"
         echo -e "  Zone:     ${CYAN}$(jq -r '.zone_name' "$CF_DDNS_CONF")${NC}"
-        echo -e "  记录类型: ${CYAN}$(jq -r '.record_types | join(" + ")' "$CF_DDNS_CONF")${NC}"
+        echo -e "  记录类型: ${CYAN}$(ddns_record_summary "$CF_DDNS_CONF")${NC}"
         echo -e "  代理状态: ${CYAN}$(jq -r 'if .proxied then "开启" else "关闭（仅 DNS）" end' "$CF_DDNS_CONF")${NC}"
         hr
         echo "  1. 修改域名 / Zone"
@@ -2781,23 +2908,27 @@ modify_cf_ddns() {
                 [[ -n "$zone_id" ]] || { err "找不到 Zone，请检查域名及 Token 权限"; pause; continue; }
                 tmp=$(mktemp)
                 jq --arg h "$hostname" --arg z "$zone_name" --arg zid "$zone_id" \
-                    '.hostname=$h | .zone_name=$z | .zone_id=$zid' "$CF_DDNS_CONF" > "$tmp" \
+                    '.hostname=$h | .zone_name=$z | .zone_id=$zid |
+                     .hostname_v4="" | .hostname_v6=""' "$CF_DDNS_CONF" > "$tmp" \
                     && save_cf_ddns_json "$tmp" || { rm -f "$tmp"; pause; continue; }
                 warn "旧域名的 DNS 记录不会自动删除，如不再使用请在 Cloudflare 手动删除"
                 apply_cf_ddns_changes; pause ;;
             2)
-                echo "  1) 仅 IPv4 (A)"
-                echo "  2) 仅 IPv6 (AAAA)"
-                echo "  3) IPv4 + IPv6"
-                read -rp "$(echo -e "${CYAN}记录类型 [1-3]: ${NC}")" mode
+                echo "  1) IPv4 DDNS (仅 A)"
+                echo "  2) IPv6 DDNS (仅 AAAA)"
+                read -rp "$(echo -e "${CYAN}记录类型 [1-2]: ${NC}")" mode
+                hostname=$(jq -r '.hostname' "$CF_DDNS_CONF")
                 case "$mode" in
                     1) record_types='["A"]' ;;
                     2) record_types='["AAAA"]' ;;
-                    3) record_types='["A","AAAA"]' ;;
                     *) err "无效选择"; pause; continue ;;
                 esac
                 tmp=$(mktemp)
-                jq --argjson types "$record_types" '.record_types=$types' "$CF_DDNS_CONF" > "$tmp" \
+                jq --argjson types "$record_types" --arg h "$hostname" --arg mode "$mode" \
+                    '.record_types=$types |
+                     if $mode=="1" then .hostname_v4=$h | .hostname_v6=""
+                     else .hostname_v4="" | .hostname_v6=$h end' \
+                    "$CF_DDNS_CONF" > "$tmp" \
                     && save_cf_ddns_json "$tmp" || { rm -f "$tmp"; pause; continue; }
                 apply_cf_ddns_changes; pause ;;
             3)
@@ -2847,8 +2978,12 @@ show_cf_ddns_status() {
         pause; return
     fi
     echo -e "  域名:     ${CYAN}$(jq -r '.hostname' "$CF_DDNS_CONF")${NC}"
+    [[ -n "$(jq -r '.hostname_v4 // empty' "$CF_DDNS_CONF")" ]] \
+        && echo -e "  IPv4 域名:${CYAN} $(jq -r '.hostname_v4' "$CF_DDNS_CONF")${NC}"
+    [[ -n "$(jq -r '.hostname_v6 // empty' "$CF_DDNS_CONF")" ]] \
+        && echo -e "  IPv6 域名:${CYAN} $(jq -r '.hostname_v6' "$CF_DDNS_CONF")${NC}"
     echo -e "  Zone:     ${CYAN}$(jq -r '.zone_name' "$CF_DDNS_CONF")${NC}"
-    echo -e "  记录类型: ${CYAN}$(jq -r '.record_types | join(" + ")' "$CF_DDNS_CONF")${NC}"
+    echo -e "  记录类型: ${CYAN}$(ddns_record_summary "$CF_DDNS_CONF")${NC}"
     echo -e "  代理状态: ${CYAN}$(jq -r 'if .proxied then "开启" else "关闭（仅 DNS）" end' "$CF_DDNS_CONF")${NC}"
     echo -e "  定时器:   ${CYAN}$(systemctl is-active sb-cloudflare-ddns.timer 2>/dev/null || true)${NC}"
     echo
@@ -3288,6 +3423,14 @@ main() {
         # 不强制要求服务端 config 存在，确保基础设施就绪后直接进菜单。
         [[ -x "$SB_SCRIPT_PATH" ]] || install_cmd
         init_dirs
+        if [[ -f "$CF_DDNS_CONF" ]]; then
+            migrate_cf_ddns_split_config || true
+            migrate_ddns_node_links || true
+            install_cf_ddns_runner
+            install_cf_ddns_units
+            systemctl enable --now sb-cloudflare-ddns.timer >/dev/null 2>&1 || true
+            systemctl start sb-cloudflare-ddns.service >/dev/null 2>&1 || true
+        fi
         # 服务端 systemd 单元缺失则补上（仅当存在服务端配置时才需要它运行）
         [[ -f "$SB_SERVICE" ]] || setup_service
         # 若已有服务端节点但 config 丢失，重建一次
