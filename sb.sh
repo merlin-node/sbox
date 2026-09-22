@@ -3,7 +3,7 @@
 # Sing-box Script v1.3 By Merlin
 # 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS
 # 支持出站: SS / VLESS-Reality / VLESS-WS-TLS / Hysteria2 / TUIC / Trojan / AnyTLS / Socks5
-# 附加功能: Cloudflare DDNS (IPv4/IPv6)
+# 附加功能: Cloudflare DDNS (IPv4/IPv6) / 家宽 API 换 IP
 # 系统:    Debian 12/13
 # 调用:    sb
 # =============================================================================
@@ -42,6 +42,13 @@ CF_DDNS_CONF="${CF_DDNS_DIR}/config.json"
 CF_DDNS_BIN="/usr/local/lib/sb-cloudflare-ddns"
 CF_DDNS_SERVICE="/etc/systemd/system/sb-cloudflare-ddns.service"
 CF_DDNS_TIMER="/etc/systemd/system/sb-cloudflare-ddns.timer"
+
+# ---- 家宽换 IP (服务商 API，独立于 sing-box) ----
+IPC_DIR="/etc/sb-ipchange"
+IPC_CONF="${IPC_DIR}/config.json"
+IPC_BIN="/usr/local/lib/sb-ipchange"
+IPC_SERVICE="/etc/systemd/system/sb-ipchange.service"
+IPC_TIMER="/etc/systemd/system/sb-ipchange.timer"
 
 msg()  { echo -e "${GREEN}[*]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
@@ -3111,6 +3118,533 @@ ddns_menu() {
 }
 
 # =============================================================================
+# 家宽换 IP (服务商 API)
+#
+# 结构
+#   引擎  ${IPC_BIN}
+#         独立的 bash 脚本（由 ipc_write_engine 生成），是唯一调用服务商 API
+#         的地方。流程: 调换 IP API → 等本机出口 IP 变化 → 立即同步 Cloudflare
+#         DDNS（若已配置）→ 把节点分享链接里的旧 IP 换成新 IP。
+#   服务  sb-ipchange.service (oneshot)。菜单里的「立即更换」也是启动这个服务，
+#         这样即使 SSH 因换 IP 断开，任务仍由 systemd 在后台跑完。
+#   定时  sb-ipchange.timer（可选）：每 N 小时 / 每天固定时间自动换一次。
+#   配置  ${IPC_CONF} (600)
+#         {"version":1, "change_url":"...", "show_url":"...", "schedule":"" | "6h" | "04:30"}
+#   状态  ${IPC_DIR}/state.json：上次换 IP 的时间与结果，用于冷却（防止触发频率限制）
+# =============================================================================
+
+# ---- 文件部署（ddns_put 见 DDNS 段）-----------------------------------------
+
+ipc_write_engine() {
+    ddns_put "$IPC_BIN" 700 <<'SB_IPC_ENGINE'
+#!/usr/bin/env bash
+# sb-ipchange —— 由 sb 脚本生成，手动修改会在下次启动 sb 时被覆盖。
+# 用法: sb-ipchange [show | change [-f]]
+#   show    通过查询 API 输出当前公网 IPv4
+#   change  调换 IP API → 等待新 IP → 同步 DDNS → 更新节点分享链接
+#           -f  忽略冷却时间
+# 环境变量: IPC_COOLDOWN (默认 120 秒)  IPC_WAIT_MAX (默认 180 秒)
+set -o pipefail
+
+CONF="/etc/sb-ipchange/config.json"
+STATE="/etc/sb-ipchange/state.json"
+NODES="/etc/sing-box/nodes.json"
+DDNS_BIN="/usr/local/lib/sb-cloudflare-ddns"
+DDNS_CONF="/etc/sb-cloudflare-ddns/config.json"
+COOLDOWN="${IPC_COOLDOWN:-120}"
+WAIT_MAX="${IPC_WAIT_MAX:-180}"
+
+log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
+die() { log "错误: $*" >&2; exit 1; }
+
+command -v curl  >/dev/null 2>&1 || die "缺少 curl"
+command -v jq    >/dev/null 2>&1 || die "缺少 jq"
+command -v flock >/dev/null 2>&1 || die "缺少 flock (util-linux)"
+[[ -r "$CONF" ]] || die "配置文件不存在: ${CONF}"
+
+CHANGE_URL=$(jq -r '.change_url // empty' "$CONF")
+SHOW_URL=$(jq -r '.show_url // empty' "$CONF")
+
+# 从响应文本中取第一个合法的公网 IPv4（API 可能返回纯文本，也可能是 JSON）
+pick_ipv4() {
+    local c a b d e
+    while read -r c; do
+        IFS=. read -r a b d e <<<"$c"
+        (( 10#$a <= 255 && 10#$b <= 255 && 10#$d <= 255 && 10#$e <= 255 )) || continue
+        [[ "$c" =~ ^(0|10|127)\. || "$c" =~ ^192\.168\. || "$c" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && continue
+        echo "$c"; return 0
+    done < <(grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    return 1
+}
+
+# 查询 API 看到的 IP（有频率限制，只在必要时调用）
+api_ip() {
+    [[ -n "$SHOW_URL" ]] || return 1
+    curl -fsS -m 10 "$SHOW_URL" 2>/dev/null | pick_ipv4
+}
+
+# 本机实际出口 IPv4（等待期间轮询用这个，不消耗服务商 API 次数）
+local_ip() {
+    curl -fsS -m 6 -4 https://api.ipify.org 2>/dev/null | pick_ipv4 \
+        || curl -fsS -m 6 -4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | pick_ipv4
+}
+
+save_state() {   # save_state 旧IP 新IP 结果
+    local tmp
+    tmp=$(mktemp "${STATE}.XXXXXX") || return 0
+    if jq -n --arg o "$1" --arg n "$2" --arg r "$3" --argjson t "$(date +%s)" \
+        '{last_ts:$t, last_old:$o, last_new:$n, last_result:$r}' > "$tmp"; then
+        chmod 600 "$tmp"; mv -f "$tmp" "$STATE"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+sync_ddns() {
+    [[ -x "$DDNS_BIN" && -f "$DDNS_CONF" ]] || return 0
+    log "同步 Cloudflare DDNS..."
+    if "$DDNS_BIN" -v update 2>&1 | sed 's/^/    /'; then
+        log "DDNS 已同步"
+    else
+        log "DDNS 同步出错，5 分钟定时器会自动重试"
+    fi
+}
+
+relink() {   # relink 旧IP 新IP：只替换 "@旧IP:" 形式，不会误伤包含相同数字的其他地址
+    local old="$1" new="$2" n tmp
+    [[ -n "$old" && -f "$NODES" ]] || return 0
+    n=$(jq --arg h "@${old}:" '[.[] | select((.link // "") | contains($h))] | length' "$NODES" 2>/dev/null) || return 0
+    (( n > 0 )) || return 0
+    tmp=$(mktemp "${NODES}.XXXXXX") || return 0
+    if jq --arg o "@${old}:" --arg n "@${new}:" \
+        'map(if (.link // "") | contains($o) then .link |= (split($o) | join($n)) else . end)' \
+        "$NODES" > "$tmp"; then
+        chmod --reference="$NODES" "$tmp"
+        mv -f "$tmp" "$NODES"
+        log "已更新 ${n} 个节点分享链接: ${old} → ${new}"
+    else
+        rm -f "$tmp"
+        log "节点分享链接更新失败，请在 sb 菜单里手动修改"
+    fi
+}
+
+cmd_show() {
+    [[ -n "$SHOW_URL" ]] || die "未配置查询 API"
+    local ip
+    ip=$(api_ip) || die "查询 API 未返回 IP"
+    echo "$ip"
+}
+
+cmd_change() {
+    local force=0
+    [[ "${1:-}" == "-f" ]] && force=1
+    [[ -n "$CHANGE_URL" ]] || die "未配置换 IP API"
+    exec 9<"$0" && flock -n 9 || die "已有换 IP 任务在执行"
+
+    local now last
+    now=$(date +%s)
+    last=$(jq -r '.last_ts // 0' "$STATE" 2>/dev/null) || last=0
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( ! force && now - last < COOLDOWN )); then
+        die "距上次换 IP 仅 $(( now - last )) 秒，需间隔 ${COOLDOWN} 秒（面板有频率限制）"
+    fi
+
+    local old new cur out code body rc i
+    old=$(local_ip) || old=$(api_ip) || old=""
+    log "当前 IP: ${old:-未知}"
+    save_state "$old" "" "requested"   # 先记下时间戳，即便后面断线也会进入冷却
+
+    log "调用换 IP API..."
+    out=$(curl -sS -m 30 -w $'\n%{http_code}' "$CHANGE_URL" 2>&1); rc=$?
+    code="${out##*$'\n'}"
+    body=$(printf '%s' "${out%$'\n'*}" | tr -d '\r' | tr '\n' ' ' | sed 's/ *$//' | cut -c1-200)
+    if (( rc != 0 )); then
+        log "请求未正常返回 (curl ${rc})；线路重拨时连接断开属正常，继续等待..."
+    elif [[ "$code" =~ ^[45] ]]; then
+        log "API 拒绝请求 (HTTP ${code}): ${body:-<空>}"
+        save_state "$old" "" "rejected"
+        exit 1
+    else
+        log "API 返回 (HTTP ${code}): ${body:-<空>}"
+    fi
+
+    log "等待新 IP 生效（最长 ${WAIT_MAX} 秒）..."
+    new=""
+    sleep 10
+    for (( i = 10; i < WAIT_MAX; i += 5 )); do
+        cur=$(local_ip) || cur=""
+        if [[ -n "$cur" && "$cur" != "$old" ]]; then new="$cur"; break; fi
+        sleep 5
+    done
+
+    if [[ -z "$new" ]]; then
+        cur=$(api_ip) || cur=""
+        if [[ -n "$cur" && "$cur" != "$old" ]]; then
+            new="$cur"   # 查询 API 显示已换，只是本机探测没跟上
+        elif [[ -n "$cur" ]]; then
+            log "IP 没有变化，仍是 ${cur}（可能分到了同一个 IP，或 API 未生效）"
+            save_state "$old" "$cur" "unchanged"; exit 2
+        else
+            log "等待超时：无法获取公网 IP，网络可能还没恢复"
+            save_state "$old" "" "timeout"; exit 3
+        fi
+    fi
+
+    log "新 IP: ${new}"
+    save_state "$old" "$new" "ok"
+    sync_ddns
+    relink "$old" "$new"
+    log "完成"
+}
+
+case "${1:-show}" in
+    show)   cmd_show ;;
+    change) shift; cmd_change "$@" ;;
+    *)      die "未知命令: $1" ;;
+esac
+SB_IPC_ENGINE
+}
+
+ipc_schedule() { jq -r '.schedule // empty' "$IPC_CONF" 2>/dev/null; }
+
+ipc_schedule_desc() {
+    local s; s=$(ipc_schedule)
+    if [[ -z "$s" ]]; then echo "关闭"
+    elif [[ "$s" =~ ^([0-9]+)h$ ]]; then echo "每 ${BASH_REMATCH[1]} 小时"
+    else echo "每天 ${s}"
+    fi
+}
+
+# systemd 单元。返回 0=有改动 / 1=无变化
+ipc_write_units() {
+    local rc=1 sched spec
+    ddns_put "$IPC_SERVICE" 644 <<EOF && rc=0
+[Unit]
+Description=Home broadband IP change via provider API (managed by sb)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${IPC_BIN} change
+TimeoutStartSec=400
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+EOF
+    sched=$(ipc_schedule)
+    if [[ -z "$sched" ]]; then
+        if [[ -f "$IPC_TIMER" ]]; then
+            systemctl disable --now sb-ipchange.timer >/dev/null 2>&1 || true
+            rm -f "$IPC_TIMER"
+            rc=0
+        fi
+        return $rc
+    fi
+    if [[ "$sched" =~ ^([0-9]+)h$ ]]; then
+        # 相对上次换 IP 计时：手动换过一次后，下次自动换会顺延
+        spec="OnActiveSec=${BASH_REMATCH[1]}h"$'\n'"OnUnitActiveSec=${BASH_REMATCH[1]}h"
+    else
+        spec="OnCalendar=*-*-* ${sched}:00"
+    fi
+    ddns_put "$IPC_TIMER" 644 <<EOF && rc=0
+[Unit]
+Description=Scheduled home broadband IP change (managed by sb)
+
+[Timer]
+${spec}
+RandomizedDelaySec=60s
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+    return $rc
+}
+
+# 部署引擎 + 单元，按配置启停定时器。幂等：内容没变就什么都不做。
+ipc_deploy() {
+    local reload=0
+    install -d -m 700 "$IPC_DIR"
+    ipc_write_engine
+    ipc_write_units && reload=1
+    (( reload )) && systemctl daemon-reload
+    if [[ -f "$IPC_TIMER" ]]; then
+        (( reload )) && systemctl restart sb-ipchange.timer >/dev/null 2>&1
+        if ! systemctl is-enabled --quiet sb-ipchange.timer 2>/dev/null \
+           || ! systemctl is-active --quiet sb-ipchange.timer 2>/dev/null; then
+            systemctl enable --now sb-ipchange.timer >/dev/null 2>&1 \
+                || warn "换 IP 定时器启动失败，请检查: systemctl status sb-ipchange.timer"
+        fi
+    fi
+    return 0
+}
+
+ipc_remove() {
+    systemctl disable --now sb-ipchange.timer >/dev/null 2>&1 || true
+    systemctl stop sb-ipchange.service >/dev/null 2>&1 || true
+    rm -f "$IPC_TIMER" "$IPC_SERVICE" "$IPC_BIN"
+    rm -rf "$IPC_DIR"
+    systemctl daemon-reload
+    ok "换 IP 服务与配置（含 API 链接）已清除"
+}
+
+# 启动 sb 时调用：保证引擎 / 单元是最新的
+ipc_bootstrap() {
+    [[ -f "$IPC_CONF" ]] || return 0
+    ipc_deploy
+}
+
+# ---- 配置读写 ----------------------------------------------------------------
+
+ipc_configured() { [[ -n "$(jq -r '.change_url // empty' "$IPC_CONF" 2>/dev/null)" ]]; }
+
+ipc_edit() {
+    local tmp
+    tmp=$(mktemp "${IPC_CONF}.XXXXXX") || { err "无法写入换 IP 配置"; return 1; }
+    if jq "$@" "$IPC_CONF" > "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$IPC_CONF"
+    else
+        rm -f "$tmp"
+        err "更新换 IP 配置失败"
+        return 1
+    fi
+}
+
+# 界面上隐藏 token：https://api.x.com/ipch/abcdefghij → https://api.x.com/ipch/abc****hij
+ipc_mask() {
+    local u="$1" t
+    [[ -z "$u" ]] && { echo "—"; return; }
+    t="${u##*/}"
+    if (( ${#t} > 6 )); then
+        echo "${u%/*}/${t:0:3}****${t: -3}"
+    else
+        echo "${u%/*}/****"
+    fi
+}
+
+ipc_valid_url() { [[ "$1" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]]; }
+
+# 已配置的 IPv4 DDNS 域名（逗号分隔）
+ipc_ddns_hosts() {
+    jq -r '[.records[]? | select(.type == "A") | .hostname] | join(", ")' "$CF_DDNS_CONF" 2>/dev/null
+}
+
+# ---- 界面 --------------------------------------------------------------------
+
+ipc_setup() {
+    clear; show_banner
+    sec "设置 / 修改换 IP API"
+    echo "  到服务商面板「API接口信息」复制「更換IP API」的完整链接粘贴到这里。"
+    echo -e "  ${YELLOW}链接里的 token 等同密码：拿到它的人都能换你的 IP。${NC}"
+    echo -e "  ${YELLOW}如果之前截图 / 外发过，先在面板点「生成API」重新生成一组。${NC}"
+    echo
+    local cu su def y
+    read -rp "$(echo -e "${CYAN}更换 IP API (回车取消): ${NC}")" cu
+    cu="${cu//[[:space:]]/}"
+    [[ -z "$cu" ]] && return
+    ipc_valid_url "$cu" || { err "链接格式不对，应以 http:// 或 https:// 开头"; pause; return; }
+
+    def=""
+    [[ "$cu" == */ipch/* ]] && def="${cu/\/ipch\//\/show\/}"
+    if [[ -n "$def" ]]; then
+        echo -e "  已推导出查询 API: ${CYAN}$(ipc_mask "$def")${NC}"
+        read -rp "$(echo -e "${CYAN}查询 IP API (回车使用上面这个): ${NC}")" su
+    else
+        read -rp "$(echo -e "${CYAN}查询 IP API (可留空): ${NC}")" su
+    fi
+    su="${su//[[:space:]]/}"
+    [[ -z "$su" ]] && su="$def"
+    if [[ -n "$su" ]] && ! ipc_valid_url "$su"; then
+        err "查询 API 链接格式不对"; pause; return
+    fi
+
+    install -d -m 700 "$IPC_DIR"
+    if [[ -f "$IPC_CONF" ]]; then
+        ipc_edit --arg c "$cu" --arg s "$su" '.change_url = $c | .show_url = $s' || { pause; return; }
+    else
+        ( umask 077
+          jq -n --arg c "$cu" --arg s "$su" \
+              '{version:1, change_url:$c, show_url:$s, schedule:""}' > "$IPC_CONF" ) \
+            || { err "写入配置失败"; pause; return; }
+    fi
+    cu=""; su=""
+    ipc_deploy
+    ok "已保存"
+
+    if [[ -n "$(jq -r '.show_url // empty' "$IPC_CONF")" ]]; then
+        msg "测试查询 API（不会换 IP）..."
+        local ip
+        if ip=$("$IPC_BIN" show 2>/dev/null); then
+            ok "查询成功，面板显示当前 IP: ${ip}"
+        else
+            warn "查询 API 没有返回 IP。不影响换 IP，只是等待新 IP 时只能靠本机探测。"
+        fi
+    fi
+    (( $(ddns_count) > 0 )) || warn "未配置 Cloudflare DDNS：换 IP 后节点地址会变，建议主菜单 d 配一个域名。"
+    pause
+}
+
+ipc_change_now() {
+    ipc_configured || { err "请先设置换 IP API (选项 3)"; pause; return; }
+    clear; show_banner
+    sec "立即更换 IP"
+    if systemctl is-active --quiet sb-ipchange.service 2>/dev/null; then
+        warn "已有换 IP 任务在执行，稍后再试"; pause; return
+    fi
+    local hosts; hosts=$(ipc_ddns_hosts)
+    echo "  流程: 调用换 IP API → 等新 IP 生效 → 同步 DDNS → 更新节点分享链接"
+    echo "  任务交给 systemd 在后台执行，终端断开不影响它完成。"
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        echo
+        warn "你正在通过 SSH 连接本机，换 IP 后这个连接会断开。"
+        if [[ -n "$hosts" ]]; then
+            echo -e "  约 1-2 分钟后用域名重连: ${CYAN}${hosts}${NC}"
+        else
+            warn "没有配置 DDNS，断开后需要到服务商面板查看新 IP 再连回来。"
+        fi
+    fi
+    echo
+    local y
+    read -rp "$(echo -e "${YELLOW}确定更换? [y/N]: ${NC}")" y
+    [[ "$y" =~ ^[Yy]$ ]] || return
+
+    local jpid i state started=0 result code
+    journalctl -u sb-ipchange.service -f -n 0 -o cat 2>/dev/null &
+    jpid=$!
+    sleep 1
+    systemctl reset-failed sb-ipchange.service >/dev/null 2>&1 || true
+    systemctl start --no-block sb-ipchange.service || { kill "$jpid" 2>/dev/null; err "启动任务失败"; pause; return; }
+    for (( i = 0; i < 420; i++ )); do
+        sleep 1
+        state=$(systemctl show -p ActiveState --value sb-ipchange.service 2>/dev/null)
+        if [[ "$state" == "activating" || "$state" == "active" ]]; then
+            started=1
+        elif (( started || i > 5 )); then
+            break
+        fi
+    done
+    sleep 1
+    kill "$jpid" 2>/dev/null; wait "$jpid" 2>/dev/null
+    result=$(systemctl show -p Result --value sb-ipchange.service 2>/dev/null)
+    code=$(systemctl show -p ExecMainStatus --value sb-ipchange.service 2>/dev/null)
+    echo
+    case "$result:$code" in
+        success:*)  ok "IP 已更换" ;;
+        *:2)        warn "IP 没有变化，可稍后再试一次" ;;
+        *)          err "换 IP 未成功，详见上方输出或选项 2 查看日志" ;;
+    esac
+    pause
+}
+
+ipc_status() {
+    clear; show_banner
+    sec "换 IP 状态"
+    ipc_configured || { warn "尚未设置换 IP API"; pause; return; }
+    local api_ip loc ts old new res next
+    api_ip=$("$IPC_BIN" show 2>/dev/null) || api_ip="查询失败"
+    loc=$(get_ip 4)
+    echo -e "  换 IP API:  ${CYAN}$(ipc_mask "$(jq -r '.change_url' "$IPC_CONF")")${NC}"
+    echo -e "  面板查询:   ${CYAN}${api_ip}${NC}"
+    echo -e "  本机出口:   ${CYAN}${loc:-获取失败}${NC}"
+    echo -e "  定时换 IP:  ${CYAN}$(ipc_schedule_desc)${NC}"
+    if [[ -f "$IPC_TIMER" ]]; then
+        next=$(systemctl show sb-ipchange.timer -p NextElapseUSecRealtime --value 2>/dev/null)
+        echo -e "  下次执行:   ${CYAN}${next:-—}${NC}"
+    fi
+    if [[ -f "${IPC_DIR}/state.json" ]]; then
+        IFS=$'\t' read -r ts old new res < <(jq -r \
+            '[(.last_ts // 0), (.last_old // ""), (.last_new // ""), (.last_result // "")] | @tsv' \
+            "${IPC_DIR}/state.json" 2>/dev/null)
+        ts=$(date -d "@${ts:-0}" '+%F %T' 2>/dev/null)
+        case "$res" in
+            ok) res="${GREEN}成功${NC}" ;; unchanged) res="${YELLOW}IP 未变${NC}" ;;
+            rejected) res="${RED}API 拒绝${NC}" ;; timeout) res="${RED}超时${NC}" ;;
+            requested) res="${YELLOW}执行中/中断${NC}" ;;
+        esac
+        echo -e "  上次换 IP:  ${CYAN}${ts}${NC}  ${old:-?} → ${new:-?}  ${res}"
+    fi
+    echo
+    echo -e "  ${BOLD}最近日志:${NC}"
+    journalctl -u sb-ipchange.service -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/  /'
+    pause
+}
+
+ipc_schedule_menu() {
+    ipc_configured || { err "请先设置换 IP API (选项 3)"; pause; return; }
+    clear; show_banner
+    sec "定时自动换 IP"
+    echo -e "  当前: ${CYAN}$(ipc_schedule_desc)${NC}"
+    echo -e "  ${YELLOW}换 IP 时节点会断线几十秒；间隔别太短，避免触发面板频率限制。${NC}"
+    hr
+    echo "  1) 每隔 N 小时"
+    echo "  2) 每天固定时间"
+    echo "  3) 关闭定时"
+    echo "  0) 返回上一页"
+    hr
+    local c v s=""
+    read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
+    case "$c" in
+        1) read -rp "$(echo -e "${CYAN}间隔小时数 [1-168]: ${NC}")" v
+           [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 168 )) || { err "无效数字"; pause; return; }
+           s="$((10#$v))h" ;;
+        2) read -rp "$(echo -e "${CYAN}时间 (24 小时制 HH:MM，本机时区 $(date +%Z)): ${NC}")" v
+           [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { err "格式应为 HH:MM，例如 04:30"; pause; return; }
+           s="$v" ;;
+        3) s="" ;;
+        *) return ;;
+    esac
+    ipc_edit --arg s "$s" '.schedule = $s' || { pause; return; }
+    ipc_deploy
+    ok "定时换 IP: $(ipc_schedule_desc)"
+    if [[ -f "$IPC_TIMER" ]]; then
+        echo -e "  下次执行: ${CYAN}$(systemctl show sb-ipchange.timer -p NextElapseUSecRealtime --value 2>/dev/null)${NC}"
+    fi
+    pause
+}
+
+ipc_delete() {
+    [[ -f "$IPC_CONF" || -f "$IPC_SERVICE" ]] || { warn "没有换 IP 配置"; pause; return; }
+    local y
+    read -rp "$(echo -e "${YELLOW}删除换 IP 配置、定时器与引擎? [y/N]: ${NC}")" y
+    [[ "$y" =~ ^[Yy]$ ]] && ipc_remove
+    pause
+}
+
+ipc_menu() {
+    while :; do
+        clear; show_banner
+        sec "家宽换 IP (服务商 API)"
+        if ipc_configured; then
+            echo -e "  API:  ${CYAN}$(ipc_mask "$(jq -r '.change_url' "$IPC_CONF")")${NC}"
+            echo -e "  定时: ${CYAN}$(ipc_schedule_desc)${NC}    DDNS 联动: $( (( $(ddns_count) > 0 )) && echo -e "${GREEN}已配置${NC}" || echo -e "${YELLOW}未配置${NC}")"
+        else
+            echo -e "  ${YELLOW}尚未设置换 IP API${NC}"
+        fi
+        hr
+        echo "  1. 立即更换 IP"
+        echo "  2. 状态 / 最近日志"
+        echo "  3. 设置 / 修改 API"
+        echo "  4. 定时自动换 IP"
+        echo "  5. 删除换 IP 配置"
+        echo "  0. 返回上一页"
+        hr
+        local c
+        read -rp "$(echo -e "${CYAN}请选择 [0-5]: ${NC}")" c
+        case "$c" in
+            1) ipc_change_now ;;
+            2) ipc_status ;;
+            3) ipc_setup ;;
+            4) ipc_schedule_menu ;;
+            5) ipc_delete ;;
+            0|"") return ;;
+            *) err "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
 # IP 优先级
 # =============================================================================
 menu_ip_strategy() {
@@ -3312,6 +3846,15 @@ do_uninstall() {
             warn "已保留 Cloudflare DDNS 服务和配置"
         fi
     fi
+    if [[ -f "$IPC_CONF" || -f "$IPC_SERVICE" ]]; then
+        echo
+        read -rp "$(echo -e "${YELLOW}检测到家宽换 IP 配置，是否一并删除 (含 API 链接)? [y/N]: ${NC}")" y
+        if [[ "$y" =~ ^[Yy]$ ]]; then
+            ipc_remove
+        else
+            warn "已保留换 IP 服务和配置"
+        fi
+    fi
     systemctl stop sing-box 2>/dev/null
     systemctl disable sing-box 2>/dev/null
     rm -f "$SB_SERVICE"
@@ -3379,6 +3922,8 @@ main_menu() {
         echo
         echo "  d. Cloudflare DDNS (动态域名解析)"
         echo
+        echo "  i. 家宽换 IP (服务商 API)"
+        echo
         echo "  6. IPv4/IPv6 优先级与策略"
         echo
         echo "  7. 配置流量使用情况"
@@ -3391,7 +3936,7 @@ main_menu() {
         echo
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请输入选项 [0-9/c/d]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请输入选项 [0-9/c/d/i]: ${NC}")" c
         case "$c" in
             1) menu_add ;;
             2) modify_node ;;
@@ -3400,6 +3945,7 @@ main_menu() {
             5) menu_routing ;;
             c|C) menu_client ;;
             d|D) ddns_menu ;;
+            i|I) ipc_menu ;;
             6) menu_ip_strategy ;;
             7) menu_traffic ;;
             8) menu_singbox ;;
@@ -3476,6 +4022,7 @@ main() {
         [[ -x "$SB_SCRIPT_PATH" ]] || install_cmd
         init_dirs
         ddns_bootstrap || true
+        ipc_bootstrap || true
         # 服务端 systemd 单元缺失则补上（仅当存在服务端配置时才需要它运行）
         [[ -f "$SB_SERVICE" ]] || setup_service
         # 若已有服务端节点但 config 丢失，重建一次
