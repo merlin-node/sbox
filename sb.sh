@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.3.1"
 SCRIPT_AUTHOR="Merlin"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/merlin-node/sbox/main/sb.sh"
 
@@ -119,6 +119,15 @@ install_deps() {
     systemctl start vnstat >/dev/null 2>&1 || true
     systemctl enable chrony >/dev/null 2>&1 || true
     systemctl start chrony >/dev/null 2>&1 || true
+    # apt 的输出被静音了，失败时要主动发现，否则后面所有 jq/curl 操作都会莫名失败
+    local c missing=()
+    for c in curl jq tar openssl uuidgen ss; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        err "依赖安装失败，缺少: ${missing[*]}（请检查网络或 apt 源后重试）"
+        exit 1
+    fi
     ok "依赖安装完成"
 }
 
@@ -133,11 +142,13 @@ check_time_sync() {
     fi
     # 取 System time 偏差（秒），绝对值 > 5 视为异常
     local offset
-    offset=$(chronyc tracking 2>/dev/null | awk -F'[ :]+' '/System time/{print $4}')
+    # 行格式: "System time     : 0.000012345 seconds slow of NTP time"，数字是第 3 个字段
+    offset=$(chronyc tracking 2>/dev/null | awk -F'[ :]+' '/System time/{print $3}')
     if [[ -z "$offset" ]]; then
         return 1
     fi
     # bash 不能直接处理浮点，借 awk 比较
+    [[ "$offset" =~ ^[0-9.]+$ ]] || return 1
     if awk -v o="$offset" 'BEGIN{exit !(o+0 < 5)}'; then
         return 0
     fi
@@ -225,11 +236,11 @@ enable_bbr() {
         return 1
     fi
     msg "写入 sysctl 配置..."
-    # 清掉旧的 BBR 相关配置（防止重复）
-    sed -i '/^net\.core\.default_qdisc/d;/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
-    echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
-    echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1
+    # Debian 13 开机不再读取 /etc/sysctl.conf，统一写到 /etc/sysctl.d 保证重启后仍生效
+    [[ -f /etc/sysctl.conf ]] && sed -i '/^net\.core\.default_qdisc/d;/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+    mkdir -p /etc/sysctl.d
+    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-sb-bbr.conf
+    sysctl -p /etc/sysctl.d/99-sb-bbr.conf >/dev/null 2>&1
     sleep 1
     if check_bbr; then
         ok "BBR 已启用"
@@ -242,7 +253,8 @@ enable_bbr() {
 
 disable_bbr() {
     msg "切回默认拥塞控制 (cubic)..."
-    sed -i '/^net\.core\.default_qdisc/d;/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+    [[ -f /etc/sysctl.conf ]] && sed -i '/^net\.core\.default_qdisc/d;/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+    rm -f /etc/sysctl.d/99-sb-bbr.conf
     sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
     sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1
     sleep 1
@@ -314,8 +326,11 @@ install_singbox() {
     if ! curl -fsSL "$url" -o "${tmp}/sb.tar.gz"; then
         err "下载失败"; rm -rf "$tmp"; return 1
     fi
-    tar -xzf "${tmp}/sb.tar.gz" -C "$tmp"
-    install -m 755 "${tmp}/sing-box-${ver}-linux-${arch}/sing-box" "$SB_BIN"
+    if ! tar -xzf "${tmp}/sb.tar.gz" -C "$tmp" \
+       || ! install -m 755 "${tmp}/sing-box-${ver}-linux-${arch}/sing-box" "${SB_BIN}.new" \
+       || ! mv -f "${SB_BIN}.new" "$SB_BIN"; then
+        err "解压或安装失败，原有 sing-box 未改动"; rm -rf "$tmp"; rm -f "${SB_BIN}.new"; return 1
+    fi
     rm -rf "$tmp"
     ok "sing-box v${ver} 已安装"
 }
@@ -336,7 +351,7 @@ init_dirs() {
 
 setup_logrotate() {
     cat > /etc/logrotate.d/sing-box <<EOF
-${SB_LOG} {
+${SB_LOG} ${SB_CLIENT_LOG} {
     size 10M
     rotate 3
     missingok
@@ -481,17 +496,24 @@ atomic_write() {
     shift
     local tmp
     tmp=$(mktemp) || return 1
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp'" RETURN
     if ! "$@" > "$tmp"; then
         err "atomic_write: 命令执行失败" >&2
-        return 1
+        rm -f "$tmp"; return 1
     fi
     if ! [[ -s "$tmp" ]]; then
         err "atomic_write: 输出为空，拒绝写入 $target" >&2
-        return 1
+        rm -f "$tmp"; return 1
     fi
     mv "$tmp" "$target"
+}
+
+# 生成不重复的节点 tag（改过端口的节点仍保留旧 tag，新节点可能撞名导致 sing-box 启动失败）
+unique_node_tag() {
+    local base="$1" tag="$1" i=2
+    while jq -e --arg t "$tag" '.[] | select(.tag == $t)' "$SB_NODES" >/dev/null 2>&1; do
+        tag="${base}-${i}"; i=$((i+1))
+    done
+    echo "$tag"
 }
 
 # listen 地址：v4 节点用 0.0.0.0，v6 节点用 ::
@@ -511,6 +533,11 @@ save_node() {
 }
 
 restart_sb() {
+    if [[ -n "${REBUILD_ERR:-}" ]]; then
+        err "配置未更新（上一步生成失败），sing-box 保持原配置运行"
+        REBUILD_ERR=""
+        return 1
+    fi
     if ! "$SB_BIN" check -c "$SB_CONF" 2>/tmp/sb_check.err; then
         err "配置校验失败:"
         cat /tmp/sb_check.err
@@ -541,7 +568,7 @@ view_log() {
 # rebuild_config: 兼容 sing-box 1.13 的配置生成
 # =============================================================================
 rebuild_config() {
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp --suffix=.json)
 
     local inbounds outbounds
     # 过滤掉 extra.inbound 为 null 的脏数据，避免 sing-box 启动失败
@@ -609,33 +636,43 @@ rebuild_config() {
         rule_sets="$rs_arr"
     fi
 
-    # 构造 route.rules:
-    # 1) 第一条：resolve action（v4/v6 优先级）
-    # 2) 用户规则
-    # 3) cn 屏蔽规则
-    local resolve_rule
-    resolve_rule=$(jq -n --arg s "$ip_strategy" \
-        '{action:"resolve", strategy:$s}')
+    # 构造 route.rules（顺序很重要）:
+    # 1) sniff    —— 嗅探协议/域名。没有它，protocol:quic 永远匹配不到；
+    #                客户端发来的是 IP 时，域名/geosite 规则也匹配不到
+    # 2) resolve  —— 全局 v4/v6 策略
+    # 3) quic 阻断（可选）
+    # 4) 用户规则 + cn 屏蔽
+    local base_rules
+    base_rules=$(jq -n --arg s "$ip_strategy" \
+        '[{action:"sniff"}, {action:"resolve", strategy:$s}]')
 
-    # 把用户规则与 cn 规则转成 sing-box 1.13 格式：
-    # 有 domain 用 domain；有 rule_set 用 rule_set；都有就并列（OR）
+    # 用户规则转换：
+    # - 没有任何匹配条件的规则直接丢弃（否则会匹配全部流量）
+    # - 去向 block    -> action:reject（block 出站在新版 sing-box 中已废弃）
+    # - 去向 ipv4-out -> 先按同样条件 resolve ipv4_only，再 route（否则 ipv4-out 只是普通直连）
+    # - 去向 ipv6-out -> 同上，ipv6_only
     local proxy_rules
     proxy_rules=$(jq -n --argjson u "$user_rules" --argjson c "$cn_block_rule" \
         '[($u + $c) | .[] |
-            (if (.rule_set | length) > 0 then {rule_set:.rule_set} else {} end) +
-            (if (.domain_list | length) > 0 then {domain_suffix:.domain_list} else {} end) +
-            {outbound:.outbound, action:"route"}
+            ((if (.rule_set | length) > 0 then {rule_set:.rule_set} else {} end) +
+             (if (.domain_list | length) > 0 then {domain_suffix:.domain_list} else {} end)) as $m |
+            select(($m | length) > 0) |
+            if   .outbound == "block"    then ($m + {action:"reject"})
+            elif .outbound == "ipv4-out" then ($m + {action:"resolve", strategy:"ipv4_only"}), ($m + {action:"route", outbound:"ipv4-out"})
+            elif .outbound == "ipv6-out" then ($m + {action:"resolve", strategy:"ipv6_only"}), ($m + {action:"route", outbound:"ipv6-out"})
+            else ($m + {action:"route", outbound:.outbound})
+            end
         ]')
 
-    # QUIC(HTTP/3) 阻断规则：拒绝后浏览器/App 会回落到 HTTP/2 走 TCP
+    # QUIC(HTTP/3) 阻断规则：依赖上面的 sniff；拒绝后浏览器/App 会回落到 HTTP/2 走 TCP
     local quic_rule="[]"
     if [[ "$block_quic" == "true" ]]; then
         quic_rule='[{"protocol":"quic","action":"reject"}]'
     fi
 
     local all_rules
-    all_rules=$(jq -n --argjson r "$resolve_rule" --argjson q "$quic_rule" --argjson p "$proxy_rules" \
-        '[$r] + $q + $p')
+    all_rules=$(jq -n --argjson b "$base_rules" --argjson q "$quic_rule" --argjson p "$proxy_rules" \
+        '$b + $q + $p')
 
     local route
     route=$(jq -n \
@@ -647,7 +684,7 @@ rebuild_config() {
     local dns
     dns=$(jq -n '{servers:[{type:"local", tag:"local"}]}')
 
-    jq -n \
+    if ! jq -n \
         --argjson dns "$dns" \
         --argjson inbounds "$inbounds" \
         --argjson outbounds "$outbounds" \
@@ -659,9 +696,27 @@ rebuild_config() {
             inbounds:$inbounds,
             outbounds:$outbounds,
             route:$route
-        }' > "$tmp"
+        }' > "$tmp" || ! [[ -s "$tmp" ]]; then
+        err "生成配置失败，保留原配置不变"
+        rm -f "$tmp"
+        REBUILD_ERR=1
+        return 1
+    fi
 
+    # 先校验再替换：新配置有问题时不覆盖正在使用的配置
+    if [[ -x "$SB_BIN" ]] && ! "$SB_BIN" check -c "$tmp" 2>/tmp/sb_check.err; then
+        err "新配置校验失败，保留原配置不变:"
+        cat /tmp/sb_check.err
+        cp -f "$tmp" "${SB_CONF}.bad" 2>/dev/null
+        rm -f "$tmp"
+        REBUILD_ERR=1
+        return 1
+    fi
+
+    [[ -f "$SB_CONF" ]] && cp -f "$SB_CONF" "${SB_CONF}.bak"
     mv "$tmp" "$SB_CONF"
+    chmod 600 "$SB_CONF"
+    REBUILD_ERR=""
 }
 # =============================================================================
 # 添加节点：分类菜单（Shadowsocks / VLESS+Reality / AnyTLS）
@@ -743,7 +798,7 @@ create_ss() {
         short_proto="ss"
     fi
     remark=$(ask_remark "${short_proto}-${port}")
-    tag="${short_proto}-${port}"
+    tag=$(unique_node_tag "${short_proto}-${port}")
 
     ip=$(get_node_address "$family" "$address_mode" "$node_address")
     [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
@@ -810,7 +865,7 @@ create_reality() {
     fi
 
     remark=$(ask_remark "reality-${mode}-${port}")
-    tag="reality-${port}"
+    tag=$(unique_node_tag "reality-${port}")
 
     local kp pubkey prvkey shortid uuid
     kp=$("$SB_BIN" generate reality-keypair) || { err "生成 keypair 失败"; pause; return; }
@@ -939,7 +994,7 @@ create_anytls() {
     fi
 
     remark=$(ask_remark "anytls-${port}")
-    tag="anytls-${port}"
+    tag=$(unique_node_tag "anytls-${port}")
     pwd=$(openssl rand -base64 16)
 
     local ip listen
@@ -1083,8 +1138,7 @@ delete_node() {
         local tmp; tmp=$(mktemp)
         jq "del(.[${idx}])" "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
         rebuild_config
-        restart_sb
-        ok "已删除 ${remark}"
+        restart_sb && ok "已删除 ${remark}"
         sleep 1
     done
 }
@@ -1229,8 +1283,7 @@ modify_port() {
     tmp=$(mktemp)
     jq --arg l "$new_link" ".[${idx}].link = \$l" "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
     rebuild_config
-    restart_sb
-    ok "端口已改为 ${new}"
+    restart_sb && ok "端口已改为 ${new}"
     sleep 1
 }
 # =============================================================================
@@ -1273,15 +1326,15 @@ ask_ob_tag() {
         read -rp "$(echo -e "${CYAN}请输入出口备注 (回车默认 ${default}): ${NC}")" tag
         tag="${tag:-$default}"
         if ! [[ "$tag" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            err "备注只能包含字母/数字/下划线/连字符"
+            err "备注只能包含字母/数字/下划线/连字符" >&2
             continue
         fi
         if [[ "$tag" =~ ^(direct|block|ipv4-out|ipv6-out)$ ]]; then
-            err "备注名与内置出口冲突"
+            err "备注名与内置出口冲突" >&2
             continue
         fi
         if jq -e --arg t "$tag" '.[] | select(.tag == $t)' "$SB_OUTBOUNDS" >/dev/null 2>&1; then
-            err "出口 ${tag} 已存在"
+            err "出口 ${tag} 已存在" >&2
             continue
         fi
         echo "$tag"
@@ -1621,9 +1674,14 @@ toggle_block_cn() {
     local new_val
     [[ "$cur" == "true" ]] && new_val=false || new_val=true
     local tmp; tmp=$(mktemp)
+    cp -f "$SB_SETTINGS" "${SB_SETTINGS}.bak"
     jq --argjson v "$new_val" '.block_cn = $v' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
     rebuild_config
-    restart_sb || return
+    if ! restart_sb; then
+        mv -f "${SB_SETTINGS}.bak" "$SB_SETTINGS"
+        rebuild_config && restart_sb >/dev/null
+        err "已撤销设置更改"; pause; return
+    fi
     [[ "$new_val" == "true" ]] && ok "已屏蔽大陆" || ok "已恢复大陆"
     pause
 }
@@ -1653,9 +1711,14 @@ toggle_block_quic() {
     local new_val
     [[ "$cur" == "true" ]] && new_val=false || new_val=true
     local tmp; tmp=$(mktemp)
+    cp -f "$SB_SETTINGS" "${SB_SETTINGS}.bak"
     jq --argjson v "$new_val" '.block_quic = $v' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
     rebuild_config
-    restart_sb || return
+    if ! restart_sb; then
+        mv -f "${SB_SETTINGS}.bak" "$SB_SETTINGS"
+        rebuild_config && restart_sb >/dev/null
+        err "已撤销设置更改"; pause; return
+    fi
     [[ "$new_val" == "true" ]] && ok "已阻断 QUIC (HTTP/3)" || ok "已放行 QUIC"
     pause
 }
@@ -1721,8 +1784,7 @@ del_rule_by_index() {
     local idx=$((c-1))
     local tmp; tmp=$(mktemp)
     jq "del(.[${idx}])" "$SB_RULES" > "$tmp" && mv "$tmp" "$SB_RULES"
-    rebuild_config; restart_sb
-    ok "规则已删除"; sleep 1
+    rebuild_config; restart_sb && ok "规则已删除"; sleep 1
 }
 
 del_outbound_by_index() {
@@ -1742,8 +1804,7 @@ del_outbound_by_index() {
     [[ "$y" =~ ^[Yy]$ ]] || return
     local tmp; tmp=$(mktemp)
     jq "del(.[${idx}])" "$SB_OUTBOUNDS" > "$tmp" && mv "$tmp" "$SB_OUTBOUNDS"
-    rebuild_config; restart_sb
-    ok "出口已删除"; sleep 1
+    rebuild_config; restart_sb && ok "出口已删除"; sleep 1
 }
 
 menu_routing() {
@@ -1806,11 +1867,13 @@ parse_vless_link() {
     else
         hostport="$rest"; query=""
     fi
+    hostport="${hostport%%/*}"   # 很多链接是 host:443/?type=... ，先去掉路径部分
     if [[ "$hostport" == \[*\]:* ]]; then
         host="${hostport%]:*}"; host="${host#[}"; port="${hostport##*:}"
     else
         host="${hostport%:*}"; port="${hostport##*:}"
     fi
+    [[ "$body" == *@* && -n "$uuid" && -n "$host" && "$port" =~ ^[0-9]+$ ]] || { echo ""; return 1; }
     local sni="" pbk="" sid="" flow="" fp="chrome"
     local IFS='&' kv k v
     for kv in $query; do
@@ -1936,7 +1999,7 @@ rebuild_client_config() {
     route_rules=$(jq '[.rules[] |
         (if (.geosite|length)>0 then {rule_set:[(.geosite[] | "geosite-\(.)")]} else {} end) +
         (if (.domain|length)>0 then {domain_suffix:.domain} else {} end) +
-        {outbound:.outbound, action:"route"}
+        (if .outbound == "block" then {action:"reject"} else {outbound:.outbound, action:"route"} end)
         | select((has("rule_set")) or (has("domain_suffix")))
     ]' "$SB_CLIENT_META")
 
@@ -1956,7 +2019,7 @@ rebuild_client_config() {
             dns:$dns,
             inbounds:[{type:"mixed", tag:"mixed-in", listen:"127.0.0.1", listen_port:$sport}],
             outbounds:$obs,
-            route:{rule_set:$rsets, rules:$rules, final:$final, auto_detect_interface:true}
+            route:{rule_set:$rsets, rules:([{action:"sniff"}] + $rules), final:$final, auto_detect_interface:true}
         }' > "$SB_CLIENT_CONF"
 }
 
@@ -2118,9 +2181,23 @@ client_outbound_add() {
     done
 
     local tmp; tmp=$(mktemp)
+    local was_active=0
+    systemctl is-active --quiet sing-box-client 2>/dev/null && was_active=1
+    cp -f "$SB_CLIENT_META" "${SB_CLIENT_META}.bak"
     jq --argjson node "$node" --arg tag "$tag" \
         '.outbounds += [($node + {tag:$tag})]' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-    rebuild_client_config && restart_client && ok "出口 ${tag} 已添加" || err "重载失败(请检查参数)"
+    if rebuild_client_config && restart_client; then
+        ok "出口 ${tag} 已添加"
+    else
+        err "重载失败(请检查参数)，已撤销本次添加"
+        mv -f "${SB_CLIENT_META}.bak" "$SB_CLIENT_META"
+        rebuild_client_config
+        if (( was_active )); then
+            restart_client >/dev/null 2>&1
+        else
+            systemctl stop sing-box-client >/dev/null 2>&1
+        fi
+    fi
     pause
 }
 
@@ -2150,6 +2227,9 @@ client_outbound_del() {
     fi
     if [[ "$(jq -r '.final' "$SB_CLIENT_META")" == "$tag" ]]; then
         warn "出口 ${tag} 是当前默认出口(final)，请先改默认出口"; pause; return
+    fi
+    if [[ "$(jq -r '.download_detour // "direct"' "$SB_CLIENT_META")" == "$tag" ]]; then
+        warn "出口 ${tag} 是 geosite 下载出口，请先在客户端设置里改掉"; pause; return
     fi
     local tmp; tmp=$(mktemp)
     jq "del(.outbounds[$((idx-1))])" "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
@@ -2294,6 +2374,7 @@ menu_client_settings() {
             1)
                 local p; read -rp "$(echo -e "${CYAN}新端口 [1024-65535]: ${NC}")" p
                 [[ "$p" =~ ^[0-9]+$ ]] && (( p>=1024 && p<=65535 )) || { err "非法"; sleep 1; continue; }
+                if [[ "$p" != "$sport" ]] && port_in_use "$p"; then err "端口 ${p} 已被占用"; sleep 1; continue; fi
                 local tmp; tmp=$(mktemp)
                 jq --argjson p "$p" '.socks_port=$p' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
                 rebuild_client_config && restart_client && ok "端口已改为 ${p}" || err "失败"
@@ -2352,7 +2433,7 @@ cc() {
 cx() {
     HTTPS_PROXY=http://127.0.0.1:${sport} \\
     HTTP_PROXY=http://127.0.0.1:${sport} \\
-    ALL_PROXY=socks5://127.0.0.1:${sport} \\
+    ALL_PROXY=socks5h://127.0.0.1:${sport} \\
     "\$@"
 }
 # <<< sb claude-code proxy <<<
@@ -2388,9 +2469,10 @@ client_test() {
     echo -e "    http:   ${GREEN}$(curl -fsSL -m 12 -x http://127.0.0.1:${sport} https://api.ipify.org 2>/dev/null || echo 获取失败)${NC}"
     echo -e "    ${YELLOW}(注: ipify 不在分流规则里，默认走 final，IP 可能是本机直连)${NC}"
     hr
-    echo -e "  ★ Claude API 可达性 (命中 anthropic 规则，走落地，用 http 入口):"
+    echo -e "  ★ Claude API 可达性 (经本地 http 入口；走哪个出口取决于你的分流规则):"
     local code
-    code=$(curl -fsSL -m 12 -o /dev/null -w '%{http_code}' -x http://127.0.0.1:${sport} https://api.anthropic.com 2>/dev/null || echo 000)
+    code=$(curl -sSL -m 12 -o /dev/null -w '%{http_code}' -x http://127.0.0.1:${sport} https://api.anthropic.com 2>/dev/null)
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
     if [[ "$code" =~ ^(200|401|403|404|405)$ ]]; then
         echo -e "    ${GREEN}可达 (HTTP ${code}) —— Claude Code 能用${NC}"
     else
@@ -3554,7 +3636,8 @@ ipc_change_now() {
     read -rp "$(echo -e "${YELLOW}确定更换? [y/N]: ${NC}")" y
     [[ "$y" =~ ^[Yy]$ ]] || return
 
-    local jpid i state started=0 result code
+    local jpid i state started=0 result code stop=0
+    trap 'stop=1' INT
     journalctl -u sb-ipchange.service -f -n 0 -o cat 2>/dev/null &
     jpid=$!
     sleep 1
@@ -3562,6 +3645,7 @@ ipc_change_now() {
     systemctl start --no-block sb-ipchange.service || { kill "$jpid" 2>/dev/null; err "启动任务失败"; pause; return; }
     for (( i = 0; i < 420; i++ )); do
         sleep 1
+        (( stop )) && break
         state=$(systemctl show -p ActiveState --value sb-ipchange.service 2>/dev/null)
         if [[ "$state" == "activating" || "$state" == "active" ]]; then
             started=1
@@ -3571,6 +3655,12 @@ ipc_change_now() {
     done
     sleep 1
     kill "$jpid" 2>/dev/null; wait "$jpid" 2>/dev/null
+    trap - INT
+    if (( stop )); then
+        echo
+        warn "已停止跟踪。换 IP 任务仍在后台执行，可稍后在选项 2 查看结果"
+        pause; return
+    fi
     result=$(systemctl show -p Result --value sb-ipchange.service 2>/dev/null)
     code=$(systemctl show -p ExecMainStatus --value sb-ipchange.service 2>/dev/null)
     echo
@@ -3723,9 +3813,16 @@ menu_ip_strategy() {
             *) err "无效"; sleep 1; continue ;;
         esac
         local tmp; tmp=$(mktemp)
+        cp -f "$SB_SETTINGS" "${SB_SETTINGS}.bak"
         jq --arg s "$new" '.ip_strategy = $s' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
         rebuild_config
-        restart_sb && ok "已切换为 ${new}"
+        if restart_sb; then
+            ok "已切换为 ${new}"
+        else
+            mv -f "${SB_SETTINGS}.bak" "$SB_SETTINGS"
+            rebuild_config && restart_sb >/dev/null
+            err "已撤销设置更改"; pause
+        fi
         sleep 1
     done
 }
@@ -3766,7 +3863,7 @@ menu_traffic() {
             1) clear; vnstat -d -i "$iface" 2>/dev/null | head -n 20; pause ;;
             2) clear; vnstat -m -i "$iface" 2>/dev/null | head -n 20; pause ;;
             3) clear; vnstat -i "$iface" 2>/dev/null; pause ;;
-            4) clear; echo "Ctrl+C 退出"; vnstat -l -i "$iface" ;;
+            4) clear; echo "Ctrl+C 退出"; trap ':' INT; vnstat -l -i "$iface"; trap - INT ;;
             5) clear; vnstat; pause ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
@@ -3821,14 +3918,16 @@ menu_singbox() {
             4) clear; systemctl status sing-box --no-pager -l | head -n 30; pause ;;
             5) clear; view_log 50; pause ;;
             6) clear; echo "Ctrl+C 退出"
+               trap ':' INT
                if [[ -s "$SB_LOG" ]]; then
                    tail -f "$SB_LOG"
                else
                    journalctl -u sing-box -f
-               fi ;;
+               fi
+               trap - INT ;;
             7) : > "$SB_LOG"; ok "日志已清空"; sleep 1 ;;
-            8) rm -f "$SB_BIN"; install_singbox force stable && restart_sb; pause ;;
-            9) rm -f "$SB_BIN"; install_singbox force beta && restart_sb; pause ;;
+            8) install_singbox force stable && restart_sb; pause ;;
+            9) install_singbox force beta && restart_sb; pause ;;
             t|T) menu_time_sync ;;
             b|B) menu_bbr ;;
             0|"") return ;;
@@ -3910,6 +4009,9 @@ do_uninstall() {
     systemctl stop sing-box 2>/dev/null
     systemctl disable sing-box 2>/dev/null
     rm -f "$SB_SERVICE"
+    systemctl stop sing-box-client 2>/dev/null
+    systemctl disable sing-box-client 2>/dev/null
+    rm -f "$SB_CLIENT_SERVICE" "$SB_CLIENT_LOG" "${SB_CLIENT_LOG}".*
     rm -f /etc/systemd/journald.conf.d/sing-box.conf
     rm -f /etc/logrotate.d/sing-box
     systemctl daemon-reload
@@ -3925,6 +4027,7 @@ do_uninstall() {
 # Banner & 主菜单
 # =============================================================================
 show_banner() {
+    REBUILD_ERR=""   # 生成失败标志只在单次操作内有效
     local sb_ver active node_count
     sb_ver=$("$SB_BIN" version 2>/dev/null | awk '/version/{print $3; exit}')
     if systemctl is-active --quiet sing-box; then
@@ -4073,6 +4176,7 @@ main() {
         # 不强制要求服务端 config 存在，确保基础设施就绪后直接进菜单。
         [[ -x "$SB_SCRIPT_PATH" ]] || install_cmd
         init_dirs
+        setup_logrotate
         ddns_bootstrap || true
         ipc_bootstrap || true
         # 服务端 systemd 单元缺失则补上（仅当存在服务端配置时才需要它运行）
