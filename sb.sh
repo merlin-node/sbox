@@ -326,7 +326,12 @@ init_dirs() {
     [[ -f "$SB_NODES" ]]     || echo '[]' > "$SB_NODES"
     [[ -f "$SB_OUTBOUNDS" ]] || echo '[]' > "$SB_OUTBOUNDS"
     [[ -f "$SB_RULES" ]]     || echo '[]' > "$SB_RULES"
-    [[ -f "$SB_SETTINGS" ]]  || echo '{"ip_strategy":"prefer_ipv4","block_cn":false}' > "$SB_SETTINGS"
+    [[ -f "$SB_SETTINGS" ]]  || echo '{"ip_strategy":"prefer_ipv4","block_cn":false,"block_quic":false}' > "$SB_SETTINGS"
+    # 老版本 settings.json 没有 block_quic，补上（默认关闭，保持原有行为）
+    if ! jq -e 'has("block_quic")' "$SB_SETTINGS" >/dev/null 2>&1; then
+        local _t; _t=$(mktemp)
+        jq '.block_quic = false' "$SB_SETTINGS" > "$_t" && mv "$_t" "$SB_SETTINGS"
+    fi
 }
 
 setup_logrotate() {
@@ -542,9 +547,10 @@ rebuild_config() {
     # 过滤掉 extra.inbound 为 null 的脏数据，避免 sing-box 启动失败
     inbounds=$(jq '[.[] | select(.extra.inbound != null) | .extra.inbound]' "$SB_NODES")
 
-    local ip_strategy block_cn
+    local ip_strategy block_cn block_quic
     ip_strategy=$(jq -r '.ip_strategy' "$SB_SETTINGS")
     block_cn=$(jq -r '.block_cn' "$SB_SETTINGS")
+    block_quic=$(jq -r '.block_quic // false' "$SB_SETTINGS")
 
     # 用户自定义出站
     local user_outbounds
@@ -621,9 +627,15 @@ rebuild_config() {
             {outbound:.outbound, action:"route"}
         ]')
 
+    # QUIC(HTTP/3) 阻断规则：拒绝后浏览器/App 会回落到 HTTP/2 走 TCP
+    local quic_rule="[]"
+    if [[ "$block_quic" == "true" ]]; then
+        quic_rule='[{"protocol":"quic","action":"reject"}]'
+    fi
+
     local all_rules
-    all_rules=$(jq -n --argjson r "$resolve_rule" --argjson p "$proxy_rules" \
-        '[$r] + $p')
+    all_rules=$(jq -n --argjson r "$resolve_rule" --argjson q "$quic_rule" --argjson p "$proxy_rules" \
+        '[$r] + $q + $p')
 
     local route
     route=$(jq -n \
@@ -1613,6 +1625,38 @@ toggle_block_cn() {
     rebuild_config
     restart_sb || return
     [[ "$new_val" == "true" ]] && ok "已屏蔽大陆" || ok "已恢复大陆"
+    pause
+}
+
+# ---------- 阻断 / 放行 QUIC (HTTP/3) ----------
+toggle_block_quic() {
+    clear; show_banner
+    sec "阻断 / 放行 QUIC (HTTP/3)"
+    local cur; cur=$(jq -r '.block_quic // false' "$SB_SETTINGS")
+    if [[ "$cur" == "true" ]]; then
+        echo -e "当前状态: ${GREEN}已阻断 QUIC${NC}"
+        echo "  1) 放行 QUIC"
+    else
+        echo -e "当前状态: ${RED}未阻断${NC}"
+        echo "  1) 阻断 QUIC"
+    fi
+    echo
+    echo -e "${YELLOW}说明:${NC} Claude / ChatGPT 等 App 会优先用 HTTP/3 (QUIC, UDP)，"
+    echo "      线路 UDP 质量差时表现为「页面能开、回答一直转圈」。"
+    echo "      阻断后会自动回落 HTTP/2 (TCP)，通常能解决卡顿。"
+    echo
+    echo "  0) 返回"
+    hr
+    local c
+    read -rp "$(echo -e "${CYAN}请选择 [0-1]: ${NC}")" c
+    [[ "$c" != "1" ]] && return
+    local new_val
+    [[ "$cur" == "true" ]] && new_val=false || new_val=true
+    local tmp; tmp=$(mktemp)
+    jq --argjson v "$new_val" '.block_quic = $v' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
+    rebuild_config
+    restart_sb || return
+    [[ "$new_val" == "true" ]] && ok "已阻断 QUIC (HTTP/3)" || ok "已放行 QUIC"
     pause
 }
 
@@ -3658,15 +3702,23 @@ menu_ip_strategy() {
         echo "  2) prefer_ipv6   优先 IPv6"
         echo "  3) ipv4_only     仅 IPv4"
         echo "  4) ipv6_only     仅 IPv6"
+        echo
+        local q; q=$(jq -r '.block_quic // false' "$SB_SETTINGS")
+        if [[ "$q" == "true" ]]; then
+            echo -e "  5) 阻断 QUIC(HTTP/3)   当前: ${GREEN}已阻断${NC}"
+        else
+            echo -e "  5) 阻断 QUIC(HTTP/3)   当前: ${RED}未阻断${NC}"
+        fi
         echo "  0) 返回上一页"
         hr
         local c new
-        read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-5]: ${NC}")" c
         case "$c" in
             1) new="prefer_ipv4" ;;
             2) new="prefer_ipv6" ;;
             3) new="ipv4_only" ;;
             4) new="ipv6_only" ;;
+            5) toggle_block_quic; continue ;;
             0|"") return ;;
             *) err "无效"; sleep 1; continue ;;
         esac
