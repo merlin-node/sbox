@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Sing-box Script v1.3 By Merlin
-# 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS
+# 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS / Snell(v5/v6, 需 sing-box ≥1.14)
 # 支持出站: SS / VLESS-Reality / VLESS-WS-TLS / Hysteria2 / TUIC / Trojan / AnyTLS / Socks5
 # 附加功能: Cloudflare DDNS (IPv4/IPv6) / 家宽 API 换 IP
 # 系统:    Debian 12/13
@@ -565,7 +565,7 @@ view_log() {
     fi
 }
 # =============================================================================
-# rebuild_config: 兼容 sing-box 1.13 的配置生成
+# rebuild_config: 兼容 sing-box 1.13 的配置生成（Snell 节点需 1.14+）
 # =============================================================================
 rebuild_config() {
     local tmp; tmp=$(mktemp --suffix=.json)
@@ -719,7 +719,7 @@ rebuild_config() {
     REBUILD_ERR=""
 }
 # =============================================================================
-# 添加节点：分类菜单（Shadowsocks / VLESS+Reality / AnyTLS）
+# 添加节点：分类菜单（Shadowsocks / VLESS+Reality / AnyTLS / Snell）
 # =============================================================================
 menu_new_proto() {
     local family="$1"
@@ -736,14 +736,17 @@ menu_new_proto() {
         echo
         echo "  3) AnyTLS"
         echo
+        echo "  4) Snell (v5 / v6)"
+        echo
         echo "  0) 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
         case "$c" in
             1) menu_ss_method "$family" "$address_mode" "$node_address"; return ;;
             2) create_reality "$family" "$address_mode" "$node_address"; return ;;
             3) create_anytls "$family" "$address_mode" "$node_address"; return ;;
+            4) menu_snell_version "$family" "$address_mode" "$node_address"; return ;;
             0|"") return ;;
             *) err "无效选择"; sleep 1 ;;
         esac
@@ -1046,6 +1049,195 @@ create_anytls() {
     pause
 }
 
+# =============================================================================
+# Snell (sing-box ≥ 1.14 原生入站，无需额外安装 snell-server)
+#
+# 节点 link 统一存为: snell://<psk>@<host>:<port>?version=..[&...]#<备注>
+#   与其他协议同为 "@host:port" 结构，因此「修改备注 / 修改端口 / 家宽换 IP /
+#   DDNS 换域名」等现有逻辑无需任何改动即可同步更新。
+#   展示时再由 snell_surge_line 把 link 转成 Surge 的 [Proxy] 配置行。
+#
+# 版本说明:
+#   v5: sing-box 有意不实现 v5 的 QUIC 代理模式，线路协议与 v4 相同，
+#       所以 Surge 端写 version=4（UDP 仍走 UDP over TCP）
+#   v6: Beta，PSK 派生流量整形，不支持 obfs，psk 需 12-255 字节
+# =============================================================================
+SNELL_MIN_SB="1.14.0"
+
+# 当前 sing-box 版本是否 ≥ $1（预发布版按基础版本号比较）
+sb_version_ge() {
+    local need="$1" cur
+    cur=$("$SB_BIN" version 2>/dev/null | awk '/version/{print $3; exit}')
+    [[ -n "$cur" ]] || return 1
+    cur="${cur%%-*}"
+    [[ "$(printf '%s\n%s\n' "$need" "$cur" | sort -V | head -n1)" == "$need" ]]
+}
+
+# 确保 sing-box 支持 Snell；版本不够时询问是否升级
+ensure_snell_support() {
+    sb_version_ge "$SNELL_MIN_SB" && return 0
+    local cur ans
+    cur=$("$SB_BIN" version 2>/dev/null | awk '/version/{print $3; exit}')
+    warn "Snell 入站需要 sing-box ≥ ${SNELL_MIN_SB}，当前版本: ${cur:-未安装}"
+    read -rp "$(echo -e "${CYAN}是否立即更新 sing-box 到最新稳定版? [Y/n]: ${NC}")" ans
+    [[ "$ans" =~ ^[Nn]$ ]] && return 1
+    install_singbox force stable || return 1
+    if ! sb_version_ge "$SNELL_MIN_SB"; then
+        err "更新后版本仍低于 ${SNELL_MIN_SB}，最新稳定版可能尚未包含 Snell，可尝试 sing-box 管理 → 9) 测试版"
+        return 1
+    fi
+    # 先用现有配置重启一次，确认旧节点在新版本下正常，再继续添加
+    restart_sb || { err "新版本 sing-box 无法加载现有配置，请先处理上面的错误"; return 1; }
+}
+
+# 百分号解码（配合 urlencode 使用）
+urldecode() {
+    printf '%b' "${1//%/\\x}"
+}
+
+# snell:// link → Surge [Proxy] 配置行
+snell_surge_line() {
+    local body="${1#snell://}" query="" frag="" psk hostport host port name
+    [[ "$body" == *"#"* ]] && { frag="${body#*#}"; body="${body%%#*}"; }
+    [[ "$body" == *"?"* ]] && { query="${body#*\?}"; body="${body%%\?*}"; }
+    psk="${body%@*}"
+    hostport="${body##*@}"
+    port="${hostport##*:}"
+    host="${hostport%:*}"
+    host="${host#[}"; host="${host%]}"          # Surge 中 IPv6 不加方括号
+
+    # Surge 策略名里的 , 和 = 会破坏配置行解析，替换掉
+    name=$(urldecode "$frag")
+    name="${name//,/-}"; name="${name//=/-}"
+    [[ -z "$name" ]] && name="Snell"
+
+    local line="${name} = snell, ${host}, ${port}, psk=${psk}"
+    local kv k v
+    local -a pairs=()
+    [[ -n "$query" ]] && IFS='&' read -ra pairs <<< "$query"
+    for kv in "${pairs[@]}"; do
+        k="${kv%%=*}"; v=$(urldecode "${kv#*=}")
+        case "$k" in
+            version|obfs|obfs-host|mode) line+=", ${k}=${v}" ;;
+        esac
+    done
+    echo "${line}, reuse=true"
+}
+
+menu_snell_version() {
+    local family="$1"
+    local address_mode="${2:-ip}"
+    local node_address="${3:-}"
+    clear; show_banner
+    sec "Snell → 选择协议版本"
+    echo "  1) Snell v5  (稳定，推荐；Surge 端按 v4 连接，无 QUIC 代理模式)"
+    echo
+    echo "  2) Snell v6  (Beta，PSK 流量整形；需 Surge iOS 5.20+ / Mac 6.7+)"
+    echo
+    echo "  0) 返回上一页"
+    hr
+    local c
+    read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
+    case "$c" in
+        1) create_snell "$family" 5 "$address_mode" "$node_address" ;;
+        2) create_snell "$family" 6 "$address_mode" "$node_address" ;;
+        0|"") return ;;
+        *) err "无效选择"; sleep 1 ;;
+    esac
+}
+
+create_snell() {
+    local family="$1" ver="$2"
+    local address_mode="${3:-ip}"
+    local node_address="${4:-}"
+
+    ensure_snell_support || { pause; return; }
+
+    local port
+    port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
+
+    # 版本专属参数：v5 → HTTP 混淆；v6 → 流量整形模式
+    local obfs="none" obfs_host="" mode="default" c
+    echo
+    if [[ "$ver" == "5" ]]; then
+        echo "请选择混淆方式:"
+        echo "  1) 不混淆   (推荐)"
+        echo "  2) HTTP 混淆"
+        read -rp "$(echo -e "${CYAN}请选择 [1-2，默认 1]: ${NC}")" c
+        case "${c:-1}" in
+            1) ;;
+            2) obfs="http"
+               read -rp "$(echo -e "${CYAN}请输入混淆 Host (默认 bing.com): ${NC}")" obfs_host
+               obfs_host="${obfs_host:-bing.com}" ;;
+            *) err "无效选择"; pause; return ;;
+        esac
+    else
+        echo "请选择流量整形模式:"
+        echo "  1) default   (加密 + 流量整形，推荐)"
+        echo "  2) unshaped  (仅加密，关闭流量整形)"
+        read -rp "$(echo -e "${CYAN}请选择 [1-2，默认 1]: ${NC}")" c
+        case "${c:-1}" in
+            1) mode="default" ;;
+            2) mode="unshaped" ;;
+            *) err "无效选择"; pause; return ;;
+        esac
+    fi
+
+    local remark tag psk
+    remark=$(ask_remark "snell-v${ver}-${port}")
+    tag=$(unique_node_tag "snell-v${ver}-${port}")
+    # 32 位十六进制：满足 v6 的 12-255 字节要求，且无需在 link / Surge 配置中转义
+    psk=$(openssl rand -hex 16)
+
+    local ip listen
+    ip=$(get_node_address "$family" "$address_mode" "$node_address")
+    [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
+    listen=$(listen_addr "$family")
+
+    local inbound query
+    if [[ "$ver" == "5" ]]; then
+        inbound=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+            --arg psk "$psk" --arg obfs "$obfs" \
+            '{type:"snell", tag:$tag, listen:$listen, listen_port:$port,
+              version:5, psk:$psk, obfs_mode:$obfs}')
+        # 客户端按 v4 连接（见上方版本说明）
+        query="version=4"
+        [[ "$obfs" == "http" ]] && query+="&obfs=http&obfs-host=$(urlencode "$obfs_host")"
+    else
+        inbound=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+            --arg psk "$psk" --arg mode "$mode" \
+            '{type:"snell", tag:$tag, listen:$listen, listen_port:$port,
+              version:6, psk:$psk, mode:$mode}')
+        query="version=6"
+        [[ "$mode" != "default" ]] && query+="&mode=${mode}"
+    fi
+
+    local link
+    link="snell://${psk}@$(ip_for_url "$ip"):${port}?${query}#$(urlencode "$remark")"
+
+    save_node "$tag" "snell-v${ver}" "$port" "$family" "$remark" "$link" \
+        "$(jq -n --argjson ib "$inbound" --arg psk "$psk" --argjson ver "$ver" \
+            --arg obfs "$obfs" --arg obfs_host "$obfs_host" --arg mode "$mode" \
+            '{inbound:$ib, psk:$psk, version:$ver, obfs:$obfs, obfs_host:$obfs_host, mode:$mode}')"
+    rebuild_config
+    restart_sb || return
+
+    echo
+    ok "节点创建成功: ${remark}"
+    echo -e "${BOLD}Surge 配置 ([Proxy] 段):${NC}"
+    echo -e "${GREEN}$(snell_surge_line "$link")${NC}"
+    echo
+    echo -e "${BOLD}节点链接 (备份 / 部分客户端可导入):${NC}"
+    echo -e "${GREEN}${link}${NC}"
+    echo
+    if [[ "$ver" == "5" ]]; then
+        warn "Surge 中请保持 version=4：sing-box 未实现 v5 的 QUIC 代理模式，改成 5 后 HTTP/3 流量可能异常"
+    else
+        warn "Snell v6 仍为 Beta，协议可能变动；升级 Surge 时请同步更新 sing-box"
+    fi
+    pause
+}
+
 menu_add_ddns() {
     local n idx host type family
     n=$(ddns_count)
@@ -1099,6 +1291,7 @@ view_nodes() {
             echo -e "${BOLD}[${i}] ${remark}${NC} ${YELLOW}(${tag})${NC}"
             echo -e "    协议: ${proto}    端口: ${port}    IPv${family}"
             echo -e "    ${GREEN}${link}${NC}"
+            [[ "$proto" == snell-* ]] && echo -e "    Surge: ${GREEN}$(snell_surge_line "$link")${NC}"
             echo
         done < <(jq -r '.[] | [.tag, .remark, .protocol, .port, .family, .link] | @tsv' "$SB_NODES")
     fi
@@ -1185,6 +1378,7 @@ modify_node_detail() {
         echo "  端口: ${port}"
         echo "  出口: IPv${family}"
         echo -e "  链接: ${GREEN}${link}${NC}"
+        [[ "$proto" == snell-* ]] && echo -e "  Surge: ${GREEN}$(snell_surge_line "$link")${NC}"
         hr
         echo "  1) 修改备注"
         echo "  2) 修改端口"
