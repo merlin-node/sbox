@@ -2,6 +2,7 @@
 # =============================================================================
 # Sing-box Script v1.3 By Merlin
 # 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS / Snell v4/v5/v6 (官方 snell-server)
+#           SS / Snell v4 可选 ShadowTLS v3
 # 支持出站: SS / VLESS-Reality / VLESS-WS-TLS / Hysteria2 / TUIC / Trojan / AnyTLS / Socks5
 # 附加功能: Cloudflare DDNS (IPv4/IPv6) / 家宽 API 换 IP
 # 系统:    Debian 12/13
@@ -655,7 +656,8 @@ rebuild_config() {
 
     local inbounds outbounds
     # 过滤掉 extra.inbound 为 null 的脏数据，避免 sing-box 启动失败
-    inbounds=$(jq '[.[] | .extra.inbound, .extra.inbound_aux | select(. != null)]' "$SB_NODES")
+    inbounds=$(jq '[.[] | .extra.inbound, (.extra.inbound_aux | if type == "array" then .[] else . end)
+                     | select(. != null)]' "$SB_NODES")
 
     local ip_strategy block_cn block_quic
     ip_strategy=$(jq -r '.ip_strategy' "$SB_SETTINGS")
@@ -729,7 +731,8 @@ rebuild_config() {
 
     # ShadowTLS 解包后转给本机 snell-server 的流量：最先命中，直接送达
     local fwd_rule
-    fwd_rule=$(jq '[.[] | .extra.inbound_aux.tag // empty]
+    fwd_rule=$(jq '[.[] | .extra.inbound_aux | if type == "array" then .[] else . end
+                     | select(type == "object" and .type == "direct") | .tag]
         | if length > 0 then [{inbound:., action:"route", outbound:"direct"}] else [] end' "$SB_NODES")
 
     local all_rules
@@ -827,9 +830,17 @@ create_ss() {
     local family="$1" method="$2"
     local address_mode="${3:-ip}"
     local node_address="${4:-}"
-    local keylen=32 is2022=0
+    local keylen=32 is2022=0 ans
     [[ "$method" == *128* ]] && keylen=16
     [[ "$method" == 2022-* ]] && is2022=1
+
+    echo
+    echo -e "  ${YELLOW}ShadowTLS: 伪装成访问真实网站，适合过墙的直连线路；专线 / 中转不需要${NC}"
+    read -rp "$(echo -e "${CYAN}是否启用 ShadowTLS 伪装? [y/N]: ${NC}")" ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        create_ss_st "$family" "$method" "$address_mode" "$node_address"
+        return
+    fi
 
     local port pwd short_proto remark tag ip
     port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
@@ -879,8 +890,8 @@ create_reality() {
     local node_address="${3:-}"
     local port sni remark tag
     port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入借用的真实网站域名 (默认 www.microsoft.com): ${NC}")" sni
-    sni="${sni:-www.microsoft.com}"
+    ask_camo_target
+    sni="$CAMO_SNI"
 
     # 选择传输模式
     echo
@@ -938,6 +949,7 @@ create_reality() {
         inbound=$(jq -n --arg tag "$tag" --argjson port "$port" \
             --arg listen "$listen" \
             --arg uuid "$uuid" --arg sni "$sni" --arg prv "$prvkey" --arg sid "$shortid" \
+            --arg hs "$CAMO_HS_SERVER" --argjson hsp "$CAMO_HS_PORT" \
             --argjson srv_up "$brutal_down" --argjson srv_down "$brutal_up" \
             '{type:"vless", tag:$tag, listen:$listen, listen_port:$port,
               users:[{uuid:$uuid}],
@@ -945,7 +957,7 @@ create_reality() {
                 brutal:{enabled:true, up_mbps:$srv_up, down_mbps:$srv_down}},
               tls:{enabled:true, server_name:$sni,
                 reality:{enabled:true,
-                  handshake:{server:$sni, server_port:443},
+                  handshake:{server:$hs, server_port:$hsp},
                   private_key:$prv, short_id:[$sid]}}}')
         # 注意: VLESS 标准分享链接无法表达 mux+brutal,客户端必须用 sing-box 完整 JSON 配置
         # 这里给出基础 vless:// 链接(无 flow),仅供 sing-box 客户端导入后手动补 mux+brutal
@@ -954,11 +966,12 @@ create_reality() {
         inbound=$(jq -n --arg tag "$tag" --argjson port "$port" \
             --arg listen "$listen" \
             --arg uuid "$uuid" --arg sni "$sni" --arg prv "$prvkey" --arg sid "$shortid" \
+            --arg hs "$CAMO_HS_SERVER" --argjson hsp "$CAMO_HS_PORT" \
             '{type:"vless", tag:$tag, listen:$listen, listen_port:$port,
               users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
               tls:{enabled:true, server_name:$sni,
                 reality:{enabled:true,
-                  handshake:{server:$sni, server_port:443},
+                  handshake:{server:$hs, server_port:$hsp},
                   private_key:$prv, short_id:[$sid]}}}')
         link="vless://${uuid}@$(ip_for_url "$ip"):${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp#$(urlencode "$remark")"
     fi
@@ -1235,44 +1248,21 @@ snell_uninstall_all() {
 # 百分号解码（配合 urlencode 使用）
 urldecode() { printf '%b' "${1//%/\\x}"; }
 
-# 内部 snell:// link → Surge [Proxy] 配置行
-snell_surge_line() {
-    local body="${1#snell://}" query="" frag="" psk hostport host port name kv
-    [[ "$body" == *"#"* ]] && { frag="${body#*#}"; body="${body%%#*}"; }
-    [[ "$body" == *"?"* ]] && { query="${body#*\?}"; body="${body%%\?*}"; }
-    psk="${body%@*}"; hostport="${body##*@}"
-    port="${hostport##*:}"; host="${hostport%:*}"
-    host="${host#[}"; host="${host%]}"            # Surge 中 IPv6 不加方括号
-
-    name=$(urldecode "$frag")
-    name="${name//,/-}"; name="${name//=/-}"      # , 和 = 会破坏 Surge 配置行
-    local line="${name:-Snell} = snell, ${host}, ${port}, psk=${psk}"
-    local -a pairs=()
-    [[ -n "$query" ]] && IFS='&' read -ra pairs <<< "$query"
-    for kv in "${pairs[@]}"; do
-        line+=", ${kv%%=*}=$(urldecode "${kv#*=}")"
-    done
-    echo "${line}, reuse=true"
-}
-
 menu_snell_version() {
     local family="$1" address_mode="${2:-ip}" node_address="${3:-}" c
     clear; show_banner
     sec "Snell → 选择协议版本 (官方 snell-server)"
-    echo "  1) Snell v4  (无 QUIC 代理)"
+    echo "  1) Snell v4  (可选 ShadowTLS 伪装；适合过墙的直连线路)"
     echo
-    echo "  2) Snell v5  (支持 QUIC 代理，需放行 UDP)"
+    echo "  2) Snell v5  (支持 QUIC 代理，需放行 UDP；适合专线 / 不过墙的线路)"
     echo
     echo "  3) Snell v6  (Beta，PSK 流量整形；需 Surge iOS 5.20+ / Mac 6.7+)"
     echo
-    echo "  4) Snell + ShadowTLS v3  (伪装成访问真实网站，类似 Reality；直连跨境推荐)"
-    echo
     echo "  0) 返回上一页"
     hr
-    read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
+    read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
     case "$c" in
         1|2|3) create_snell "$family" $((c + 3)) "$address_mode" "$node_address" ;;
-        4) create_snell_st "$family" "$address_mode" "$node_address" ;;
         0|"") return ;;
         *) err "无效选择"; sleep 1 ;;
     esac
@@ -1280,7 +1270,23 @@ menu_snell_version() {
 
 create_snell() {
     local family="$1" ver="$2" address_mode="${3:-ip}" node_address="${4:-}"
-    local gen; gen=$(snell_gen "$ver")
+    local gen c SNELL_OBFS_PRESET=""; gen=$(snell_gen "$ver")
+    if [[ "$ver" == "4" ]]; then
+        echo
+        echo "请选择伪装方式:"
+        echo "  1) 不伪装      (专线 / 不过墙的线路)"
+        echo "  2) HTTP 混淆   (较弱；Egern 唯一支持的 Snell 伪装)"
+        echo "  3) ShadowTLS   (推荐过墙使用；仅 Surge 支持)"
+        read -rp "$(echo -e "${CYAN}请选择 [1-3，默认 1]: ${NC}")" c
+        case "${c:-1}" in
+            1) SNELL_OBFS_PRESET="none" ;;
+            2) SNELL_OBFS_PRESET="http" ;;
+            3) create_snell_st "$family" "$address_mode" "$node_address"; return ;;
+            *) err "无效选择"; pause; return ;;
+        esac
+    else
+        SNELL_OBFS_PRESET=""
+    fi
     install_snell_server "$gen" || { pause; return; }
 
     local port
@@ -1298,10 +1304,17 @@ create_snell() {
             1) ;; 2) mode="unshaped" ;;
             *) err "无效选择"; pause; return ;;
         esac
+    elif [[ -n "$SNELL_OBFS_PRESET" ]]; then
+        # v4 已在前面选过
+        if [[ "$SNELL_OBFS_PRESET" == "http" ]]; then
+            obfs="http"
+            read -rp "$(echo -e "${CYAN}请输入混淆 Host (默认 bing.com): ${NC}")" obfs_host
+            obfs_host="${obfs_host:-bing.com}"
+        fi
     else
         echo "请选择混淆方式:"
-        echo "  1) 不混淆   (推荐)"
-        echo "  2) HTTP 混淆"
+        echo "  1) 不混淆      (推荐：v5 适合不过墙的线路)"
+        echo "  2) HTTP 混淆   (较弱；Egern 唯一支持的 Snell 伪装)"
         read -rp "$(echo -e "${CYAN}请选择 [1-2，默认 1]: ${NC}")" c
         case "${c:-1}" in
             1) ;;
@@ -1339,7 +1352,7 @@ create_snell() {
     echo
     ok "节点创建成功: ${remark}"
     echo -e "${BOLD}节点配置 (整行复制到 Sub-Store / Surge):${NC}"
-    echo -e "${GREEN}$(snell_surge_line "$link")${NC}"
+    echo -e "${GREEN}$(node_config_line "$link")${NC}"
     echo
     case "$ver" in
         5) warn "v5 的 QUIC 代理走 UDP：防火墙 / 安全组 / 中转机都要同时放行 ${port} 的 TCP 和 UDP" ;;
@@ -1360,8 +1373,8 @@ create_snell_st() {
     local port sni inner
     # 默认随机高位端口；需要的话也可以手动填 443
     port=$(ask_port "请输入端口" "$(random_port)" 1) || { pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入伪装的真实网站 (需支持 TLS 1.3，默认 www.microsoft.com): ${NC}")" sni
-    sni="${sni:-www.microsoft.com}"
+    ask_camo_target
+    sni="$CAMO_SNI"
     inner=$(random_port) || { pause; return; }
 
     local remark tag unit psk stpw ip
@@ -1378,10 +1391,10 @@ create_snell_st() {
         '{type:"direct", tag:$tag, listen:"127.0.0.1",
           override_address:"127.0.0.1", override_port:$inner}')
     inbound=$(jq -n --arg tag "$tag" --arg listen "$(listen_addr "$family")" --argjson port "$port" \
-        --arg pw "$stpw" --arg sni "$sni" --arg detour "${tag}-fwd" \
+        --arg pw "$stpw" --arg hs "$CAMO_HS_SERVER" --argjson hsp "$CAMO_HS_PORT" --arg detour "${tag}-fwd" \
         '{type:"shadowtls", tag:$tag, listen:$listen, listen_port:$port, version:3,
           users:[{name:"surge", password:$pw}],
-          handshake:{server:$sni, server_port:443},
+          handshake:{server:$hs, server_port:$hsp},
           strict_mode:true, detour:$detour}')
 
     local link="snell://${psk}@$(ip_for_url "$ip"):${port}?version=4"
@@ -1412,10 +1425,121 @@ create_snell_st() {
     echo
     ok "节点创建成功: ${remark}"
     echo -e "${BOLD}节点配置 (整行复制到 Sub-Store / Surge):${NC}"
-    echo -e "${GREEN}$(snell_surge_line "$link")${NC}"
+    echo -e "${GREEN}$(node_config_line "$link")${NC}"
     echo
     warn "防火墙 / 安全组只需放行 ${port}/TCP；snell-server 只监听本机 ${inner} 端口，不对外"
     pause
+}
+
+# SS / SS-2022 + ShadowTLS v3（全部由 sing-box 实现）：
+#   公网 TCP 端口 → shadowtls 入站（握手转发给伪装目标）→ 本机 shadowsocks 入站
+#   UDP 不经过 ShadowTLS，单独开一个公网端口给 shadowsocks（客户端用 udp-port 指定）
+create_ss_st() {
+    local family="$1" method="$2" address_mode="${3:-ip}" node_address="${4:-}"
+    local keylen=32 short_proto="ss" pwd
+    [[ "$method" == *128* ]] && keylen=16
+    if [[ "$method" == 2022-* ]]; then
+        pwd=$(openssl rand -base64 "$keylen"); short_proto="ss2022"
+    else
+        pwd=$(openssl rand -base64 16)
+    fi
+
+    local port udp_port
+    port=$(ask_port "请输入端口 (TCP，ShadowTLS)" "$(random_port)" 1) || { pause; return; }
+    udp_port=$(random_port) || { pause; return; }
+    ask_camo_target
+
+    local remark tag stpw ip listen
+    remark=$(ask_remark "${short_proto}-st-${port}")
+    tag=$(unique_node_tag "${short_proto}-st-${port}")
+    stpw=$(openssl rand -hex 16)
+    ip=$(get_node_address "$family" "$address_mode" "$node_address")
+    [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
+    listen=$(listen_addr "$family")
+
+    local inbound aux
+    inbound=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+        --arg pw "$stpw" --arg hs "$CAMO_HS_SERVER" --argjson hsp "$CAMO_HS_PORT" --arg detour "${tag}-ss" \
+        '{type:"shadowtls", tag:$tag, listen:$listen, listen_port:$port, version:3,
+          users:[{name:"user", password:$pw}],
+          handshake:{server:$hs, server_port:$hsp}, strict_mode:true, detour:$detour}')
+    aux=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson up "$udp_port" \
+        --arg m "$method" --arg pwd "$pwd" \
+        '[{type:"shadowsocks", tag:($tag + "-ss"), listen:"127.0.0.1", network:"tcp", method:$m, password:$pwd},
+          {type:"shadowsocks", tag:($tag + "-udp"), listen:$listen, listen_port:$up, network:"udp", method:$m, password:$pwd}]')
+
+    local b64 link
+    b64=$(echo -n "${method}:${pwd}" | base64 -w0 | tr -d '=' | tr '/+' '_-')
+    link="ss://${b64}@$(ip_for_url "$ip"):${port}?udp-port=${udp_port}"
+    link+="&shadow-tls-password=${stpw}&shadow-tls-sni=$(urlencode "$CAMO_SNI")&shadow-tls-version=3"
+    link+="#$(urlencode "$remark")"
+
+    save_node "$tag" "${short_proto}-st" "$port" "$family" "$remark" "$link" \
+        "$(jq -n --argjson ib "$inbound" --argjson aux "$aux" --arg sni "$CAMO_SNI" --argjson up "$udp_port" \
+            '{inbound:$ib, inbound_aux:$aux, sni:$sni, udp_port:$up}')" || { pause; return; }
+    rebuild_config
+    if ! restart_sb; then
+        json_edit "$SB_NODES" 'del(.[-1])'
+        rebuild_config && restart_sb >/dev/null
+        err "已撤销本次添加"
+        pause; return
+    fi
+
+    echo
+    ok "节点创建成功: ${remark}"
+    echo -e "${BOLD}节点配置 (整行复制到 Sub-Store / Surge):${NC}"
+    echo -e "${GREEN}$(node_config_line "$link")${NC}"
+    echo
+    warn "防火墙 / 安全组放行: ${port}/TCP 和 ${udp_port}/UDP"
+    pause
+}
+
+# 内部链接 → Surge [Proxy] 配置行（Snell 和带 ShadowTLS 的 SS 用；Sub-Store 能识别这种格式）
+#   snell://<psk>@<host>:<port>?k=v&...#<备注>
+#   ss://<base64url(method:password)>@<host>:<port>?k=v&...#<备注>
+node_config_line() {
+    local link="$1" scheme="${1%%://*}" body="${1#*://}" query="" frag="" cred hostport host port name kv
+    [[ "$body" == *"#"* ]] && { frag="${body#*#}"; body="${body%%#*}"; }
+    [[ "$body" == *"?"* ]] && { query="${body#*\?}"; body="${body%%\?*}"; }
+    cred="${body%@*}"; hostport="${body##*@}"
+    port="${hostport##*:}"; host="${hostport%:*}"
+    host="${host#[}"; host="${host%]}"            # Surge 中 IPv6 不加方括号
+
+    name=$(urldecode "$frag")
+    name="${name//,/-}"; name="${name//=/-}"      # , 和 = 会破坏 Surge 配置行
+
+    local line
+    if [[ "$scheme" == "ss" ]]; then
+        local b64="${cred//_//}" plain
+        b64="${b64//-/+}"
+        while (( ${#b64} % 4 )); do b64+="="; done
+        plain=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+        line="${name:-SS} = ss, ${host}, ${port}, encrypt-method=${plain%%:*}, password=${plain#*:}"
+    else
+        line="${name:-Snell} = snell, ${host}, ${port}, psk=${cred}"
+    fi
+    local -a pairs=()
+    [[ -n "$query" ]] && IFS='&' read -ra pairs <<< "$query"
+    for kv in "${pairs[@]}"; do
+        line+=", ${kv%%=*}=$(urldecode "${kv#*=}")"
+    done
+    if [[ "$scheme" == "ss" ]]; then
+        echo "${line}, udp-relay=true"
+    else
+        echo "${line}, reuse=true"
+    fi
+}
+
+# 选择伪装目标（Reality / ShadowTLS 共用），结果写入全局变量：
+#   CAMO_SNI       客户端使用的 SNI
+#   CAMO_HS_SERVER 服务端握手转发到的地址
+#   CAMO_HS_PORT   服务端握手转发到的端口
+ask_camo_target() {
+    local host
+    read -rp "$(echo -e "${CYAN}请输入借用的网站 (需支持 TLS 1.3，默认 www.microsoft.com): ${NC}")" host
+    CAMO_SNI="${host:-www.microsoft.com}"
+    CAMO_HS_SERVER="$CAMO_SNI"
+    CAMO_HS_PORT=443
 }
 
 menu_add_ddns() {
@@ -1470,8 +1594,8 @@ view_nodes() {
             i=$((i+1))
             echo -e "${BOLD}[${i}] ${remark}${NC} ${YELLOW}(${tag})${NC}"
             echo -e "    协议: ${proto}    端口: ${port}    IPv${family}"
-            if [[ "$link" == snell://* ]]; then
-                echo -e "    ${GREEN}$(snell_surge_line "$link")${NC}"
+            if [[ "$link" == snell://* || "$link" == *shadow-tls-* ]]; then
+                echo -e "    ${GREEN}$(node_config_line "$link")${NC}"
                 if [[ -n "$unit" ]] && ! systemctl is-active --quiet "$unit"; then
                     echo -e "    ${RED}snell-server 未运行${NC} (journalctl -u ${unit} 查看原因)"
                 fi
@@ -1570,8 +1694,8 @@ modify_node_detail() {
         echo "  协议: ${proto}"
         echo "  端口: ${port}"
         echo "  出口: IPv${family}"
-        if [[ "$link" == snell://* ]]; then
-            echo -e "  配置: ${GREEN}$(snell_surge_line "$link")${NC}"
+        if [[ "$link" == snell://* || "$link" == *shadow-tls-* ]]; then
+            echo -e "  配置: ${GREEN}$(node_config_line "$link")${NC}"
         else
             echo -e "  链接: ${GREEN}${link}${NC}"
         fi
