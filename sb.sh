@@ -437,7 +437,8 @@ ip_for_url() {
 random_port() {
     local i p
     for (( i=0; i<50; i++ )); do
-        p=$(( RANDOM % 64512 + 1024 ))
+        # $RANDOM 最大只有 32767，拼两个才能覆盖到 65535
+        p=$(( ((RANDOM << 15) | RANDOM) % 55536 + 10000 ))     # 10000-65535
         port_in_use "$p" || { echo "$p"; return 0; }
     done
     err "无法找到可用端口" >&2
@@ -445,11 +446,11 @@ random_port() {
 }
 
 ask_port() {
-    local prompt="$1" default="$2" port
+    local prompt="$1" default="$2" min="${3:-1024}" port
     read -rp "$(echo -e "${CYAN}${prompt} [默认 ${default}]: ${NC}")" port
     port="${port:-$default}"
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
-        err "端口必须是 1024-65535 的整数" >&2
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < min || port > 65535 )); then
+        err "端口必须是 ${min}-65535 的整数" >&2
         return 1
     fi
     if port_in_use "$port"; then
@@ -654,7 +655,7 @@ rebuild_config() {
 
     local inbounds outbounds
     # 过滤掉 extra.inbound 为 null 的脏数据，避免 sing-box 启动失败
-    inbounds=$(jq '[.[] | select(.extra.inbound != null) | .extra.inbound]' "$SB_NODES")
+    inbounds=$(jq '[.[] | .extra.inbound, .extra.inbound_aux | select(. != null)]' "$SB_NODES")
 
     local ip_strategy block_cn block_quic
     ip_strategy=$(jq -r '.ip_strategy' "$SB_SETTINGS")
@@ -726,9 +727,14 @@ rebuild_config() {
         quic_rule='[{"protocol":"quic","action":"reject"}]'
     fi
 
+    # ShadowTLS 解包后转给本机 snell-server 的流量：最先命中，直接送达
+    local fwd_rule
+    fwd_rule=$(jq '[.[] | .extra.inbound_aux.tag // empty]
+        | if length > 0 then [{inbound:., action:"route", outbound:"direct"}] else [] end' "$SB_NODES")
+
     local all_rules
-    all_rules=$(jq -n --argjson b "$base_rules" --argjson q "$quic_rule" --argjson p "$proxy_rules" \
-        '$b + $q + $p')
+    all_rules=$(jq -n --argjson f "$fwd_rule" --argjson b "$base_rules" --argjson q "$quic_rule" --argjson p "$proxy_rules" \
+        '$f + $b + $q + $p')
 
     local route
     route=$(jq -n \
@@ -1089,6 +1095,7 @@ create_anytls() {
 #
 #   v4 / v5 → snell-server v5（v5 服务端兼容 v4 客户端；v5 的 QUIC 代理需放行 UDP）
 #   v6      → snell-server v6（Beta，PSK 流量整形，无 obfs / QUIC 代理）
+#   +ShadowTLS → snell-server v5 仅监听本机，由 sing-box 的 shadowtls 入站对外（见 create_snell_st）
 #
 # 每个节点一个 systemd 实例 snell<5|6>@<tag>，配置 /etc/snell/<tag>.conf。
 # 节点记录里 extra.unit 非空即表示由 snell-server 承载（不写 extra.inbound，
@@ -1156,12 +1163,15 @@ UNIT
 
 # 按 nodes.json 第 idx 个节点生成配置并（重）启实例；失败打印日志
 snell_sync_idx() {
-    local idx="$1" tag ver family port psk obfs mode unit listen strategy
-    IFS=$'\t' read -r tag ver family port psk obfs mode unit < <(jq -r --argjson i "$idx" \
+    local idx="$1" tag ver family port psk obfs mode unit inner listen strategy
+    IFS=$'\t' read -r tag ver family port psk obfs mode unit inner < <(jq -r --argjson i "$idx" \
         '.[$i] | [.tag, .extra.version, .family, .port, .extra.psk,
-                  (.extra.obfs // "none"), (.extra.mode // "default"), .extra.unit] | map(tostring) | @tsv' "$SB_NODES")
+                  (.extra.obfs // "none"), (.extra.mode // "default"), .extra.unit,
+                  (.extra.inner_port // "")] | map(tostring) | @tsv' "$SB_NODES")
 
-    if [[ "$family" == "6" ]]; then
+    if [[ -n "$inner" ]]; then
+        listen="127.0.0.1:${inner}"        # 前面有 ShadowTLS，snell-server 不对外
+    elif [[ "$family" == "6" ]]; then
         [[ "$ver" == "6" ]] && listen="[::]:${port}" || listen="::0:${port}"
     else
         listen="0.0.0.0:${port}"
@@ -1255,11 +1265,14 @@ menu_snell_version() {
     echo
     echo "  3) Snell v6  (Beta，PSK 流量整形；需 Surge iOS 5.20+ / Mac 6.7+)"
     echo
+    echo "  4) Snell + ShadowTLS v3  (伪装成访问真实网站，类似 Reality；直连跨境推荐)"
+    echo
     echo "  0) 返回上一页"
     hr
-    read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
+    read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" c
     case "$c" in
         1|2|3) create_snell "$family" $((c + 3)) "$address_mode" "$node_address" ;;
+        4) create_snell_st "$family" "$address_mode" "$node_address" ;;
         0|"") return ;;
         *) err "无效选择"; sleep 1 ;;
     esac
@@ -1332,6 +1345,76 @@ create_snell() {
         5) warn "v5 的 QUIC 代理走 UDP：防火墙 / 安全组 / 中转机都要同时放行 ${port} 的 TCP 和 UDP" ;;
         6) warn "Snell v6 仍是 Beta：以后升级 Surge 时，记得同时更新服务端" ;;
     esac
+    pause
+}
+
+# Snell + ShadowTLS v3：
+#   公网端口 → sing-box shadowtls 入站（握手转发给真实网站，伪装成访问它）
+#            → direct 入站（仅作 detour 目标）→ 本机 127.0.0.1:<内部端口> 的 snell-server
+#   snell-server 只监听本机，不暴露在公网；UDP 也封装在 TCP 里走 TLS 伪装，
+#   因此 Surge 端用 version=4（v5 的 QUIC 代理需要公网 UDP，无法伪装）。
+create_snell_st() {
+    local family="$1" address_mode="${2:-ip}" node_address="${3:-}"
+    install_snell_server 5 || { pause; return; }
+
+    local port sni inner
+    # 默认随机高位端口；需要的话也可以手动填 443
+    port=$(ask_port "请输入端口" "$(random_port)" 1) || { pause; return; }
+    read -rp "$(echo -e "${CYAN}请输入伪装的真实网站 (需支持 TLS 1.3，默认 www.microsoft.com): ${NC}")" sni
+    sni="${sni:-www.microsoft.com}"
+    inner=$(random_port) || { pause; return; }
+
+    local remark tag unit psk stpw ip
+    remark=$(ask_remark "snell-st-${port}")
+    tag=$(unique_node_tag "snell-st-${port}")
+    unit="snell5@${tag}"
+    psk=$(openssl rand -hex 16)
+    stpw=$(openssl rand -hex 16)
+    ip=$(get_node_address "$family" "$address_mode" "$node_address")
+    [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
+
+    local inbound aux
+    aux=$(jq -n --arg tag "${tag}-fwd" --argjson inner "$inner" \
+        '{type:"direct", tag:$tag, listen:"127.0.0.1",
+          override_address:"127.0.0.1", override_port:$inner}')
+    inbound=$(jq -n --arg tag "$tag" --arg listen "$(listen_addr "$family")" --argjson port "$port" \
+        --arg pw "$stpw" --arg sni "$sni" --arg detour "${tag}-fwd" \
+        '{type:"shadowtls", tag:$tag, listen:$listen, listen_port:$port, version:3,
+          users:[{name:"surge", password:$pw}],
+          handshake:{server:$sni, server_port:443},
+          strict_mode:true, detour:$detour}')
+
+    local link="snell://${psk}@$(ip_for_url "$ip"):${port}?version=4"
+    link+="&shadow-tls-password=${stpw}&shadow-tls-sni=$(urlencode "$sni")&shadow-tls-version=3"
+    link+="#$(urlencode "$remark")"
+
+    save_node "$tag" "snell-st" "$port" "$family" "$remark" "$link" \
+        "$(jq -n --arg unit "$unit" --arg psk "$psk" --argjson inner "$inner" \
+            --arg stpw "$stpw" --arg sni "$sni" --argjson ib "$inbound" --argjson aux "$aux" \
+            '{unit:$unit, psk:$psk, version:4, obfs:"none", inner_port:$inner,
+              st_password:$stpw, sni:$sni, inbound:$ib, inbound_aux:$aux}')" || { pause; return; }
+
+    # 先起 snell-server，再让 sing-box 加载 ShadowTLS；任一失败整体回滚
+    if ! snell_sync_idx "$(( $(jq 'length' "$SB_NODES") - 1 ))"; then
+        snell_remove_unit "$unit" "$tag"
+        json_edit "$SB_NODES" 'del(.[-1])'
+        pause; return
+    fi
+    rebuild_config
+    if ! restart_sb; then
+        snell_remove_unit "$unit" "$tag"
+        json_edit "$SB_NODES" 'del(.[-1])'
+        rebuild_config && restart_sb >/dev/null
+        err "已撤销本次添加"
+        pause; return
+    fi
+
+    echo
+    ok "节点创建成功: ${remark}"
+    echo -e "${BOLD}节点配置 (整行复制到 Sub-Store / Surge):${NC}"
+    echo -e "${GREEN}$(snell_surge_line "$link")${NC}"
+    echo
+    warn "防火墙 / 安全组只需放行 ${port}/TCP；snell-server 只监听本机 ${inner} 端口，不对外"
     pause
 }
 
@@ -1431,15 +1514,16 @@ delete_node() {
         read -rp "$(echo -e "${YELLOW}确定删除 ${remark} (端口 ${port})? [y/N]: ${NC}")" y
         [[ "$y" =~ ^[Yy]$ ]] || continue
         [[ -f "${SB_CERT_DIR}/${tag}.crt" ]] && rm -f "${SB_CERT_DIR}/${tag}.crt" "${SB_CERT_DIR}/${tag}.key"
-        local unit; unit=$(jq -r ".[${idx}].extra.unit // empty" "$SB_NODES")
+        local unit has_ib
+        unit=$(jq -r ".[${idx}].extra.unit // empty" "$SB_NODES")
+        has_ib=$(jq -r ".[${idx}].extra.inbound != null" "$SB_NODES")
         json_edit "$SB_NODES" --argjson i "$idx" 'del(.[$i])' || { pause; continue; }
-        if [[ -n "$unit" ]]; then
-            # 官方 snell-server 节点：只停它自己的实例，不动 sing-box
-            snell_remove_unit "$unit" "$tag"
-            ok "已删除 ${remark}"
-        else
+        [[ -n "$unit" ]] && snell_remove_unit "$unit" "$tag"
+        if [[ "$has_ib" == "true" ]]; then
             rebuild_config
             restart_sb && ok "已删除 ${remark}"
+        else
+            ok "已删除 ${remark}"     # 纯 snell-server 节点，不必重启 sing-box
         fi
         sleep 1
     done
@@ -1580,11 +1664,11 @@ modify_port() {
     ' <<< "$link")
 
     json_edit "$SB_NODES" --argjson i "$idx" --arg l "$new_link" '.[$i].link = $l'
-    if [[ -n "$(jq -r ".[${idx}].extra.unit // empty" "$SB_NODES")" ]]; then
-        snell_sync_idx "$idx" && ok "端口已改为 ${new}"
-    else
+    if [[ "$(jq -r ".[${idx}].extra.inbound != null" "$SB_NODES")" == "true" ]]; then
         rebuild_config
         restart_sb && ok "端口已改为 ${new}"
+    else
+        snell_sync_idx "$idx" && ok "端口已改为 ${new}"
     fi
     sleep 1
 }
