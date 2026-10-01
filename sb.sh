@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Sing-box Script v1.3 By Merlin
-# 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS / Snell(v5/v6, 需 sing-box ≥1.14)
+# 支持入站: Shadowsocks(老版+2022) / VLESS+Reality / AnyTLS / Snell v4/v5/v6 (官方 snell-server)
 # 支持出站: SS / VLESS-Reality / VLESS-WS-TLS / Hysteria2 / TUIC / Trojan / AnyTLS / Socks5
 # 附加功能: Cloudflare DDNS (IPv4/IPv6) / 家宽 API 换 IP
 # 系统:    Debian 12/13
@@ -71,23 +71,21 @@ hr() {
 }
 
 # 居中带标题的分割线，自适应宽度（考虑中文宽度=2）
-sec() {
-    local title="$1" w side_eq
+
+# 居中标题线：center_line <颜色> <标题>（中文按宽度 2 计）
+center_line() {
+    local color="$1" title="$2" w bytes chars side bar
     w=$(term_width)
-    # 估算可视宽度：bytes - chars = UTF-8 多字节累计，÷2 = 中文字符数
-    local bytes chars non_ascii_chars ascii_chars visual
     bytes=$(printf '%s' " ${title} " | wc -c)
     chars=$(printf '%s' " ${title} " | wc -m)
-    non_ascii_chars=$(( (bytes - chars) / 2 ))
-    ascii_chars=$(( chars - non_ascii_chars ))
-    visual=$(( ascii_chars + non_ascii_chars * 2 ))
-    side_eq=$(( (w - visual) / 2 ))
-    (( side_eq < 3 )) && side_eq=3
-    local left right
-    left=$(printf "%${side_eq}s" '' | tr ' ' '=')
-    right=$(printf "%${side_eq}s" '' | tr ' ' '=')
-    echo -e "${BLUE}${left} ${BOLD}${title}${NC}${BLUE} ${right}${NC}"
+    # 中文在 UTF-8 中占 3 字节、显示宽度 2：可视宽度 = 字符数 + 中文字符数
+    side=$(( (w - chars - (bytes - chars) / 2) / 2 ))
+    (( side < 3 )) && side=3
+    bar=$(printf "%${side}s" '' | tr ' ' '=')
+    echo -e "${color}${bar} ${BOLD}${title}${NC}${color} ${bar}${NC}"
 }
+
+sec() { center_line "$BLUE" "$1"; }
 
 sub()  { echo -e "${BLUE}>>> ${BOLD}$1${NC}"; }
 
@@ -343,10 +341,8 @@ init_dirs() {
     [[ -f "$SB_RULES" ]]     || echo '[]' > "$SB_RULES"
     [[ -f "$SB_SETTINGS" ]]  || echo '{"ip_strategy":"prefer_ipv4","block_cn":false,"block_quic":false}' > "$SB_SETTINGS"
     # 老版本 settings.json 没有 block_quic，补上（默认关闭，保持原有行为）
-    if ! jq -e 'has("block_quic")' "$SB_SETTINGS" >/dev/null 2>&1; then
-        local _t; _t=$(mktemp)
-        jq '.block_quic = false' "$SB_SETTINGS" > "$_t" && mv "$_t" "$SB_SETTINGS"
-    fi
+    jq -e 'has("block_quic")' "$SB_SETTINGS" >/dev/null 2>&1 \
+        || json_edit "$SB_SETTINGS" '.block_quic = false'
 }
 
 setup_logrotate() {
@@ -490,21 +486,108 @@ urlencode() {
     printf '%s' "$1" | jq -sRr @uri
 }
 
-# 原子写入 JSON 文件：jq 失败则保留原文件，临时文件自动清理
-atomic_write() {
-    local target="$1"
+# 原子改写 JSON 文件：json_edit <文件> [jq 参数...] '<过滤器>'
+# 临时文件放在目标同目录（mv 不跨文件系统），输出须为合法 JSON，并保留原文件权限
+json_edit() {
+    local file="$1" tmp
     shift
-    local tmp
-    tmp=$(mktemp) || return 1
-    if ! "$@" > "$tmp"; then
-        err "atomic_write: 命令执行失败" >&2
-        rm -f "$tmp"; return 1
+    tmp=$(mktemp "${file}.XXXXXX") || { err "无法写入 ${file}" >&2; return 1; }
+    if jq "$@" "$file" > "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
+        chmod --reference="$file" "$tmp" 2>/dev/null
+        mv -f "$tmp" "$file"
+    else
+        rm -f "$tmp"
+        err "写入 ${file} 失败" >&2
+        return 1
     fi
-    if ! [[ -s "$tmp" ]]; then
-        err "atomic_write: 输出为空，拒绝写入 $target" >&2
-        rm -f "$tmp"; return 1
+}
+
+# 修改服务端数据文件 → 重建配置 → 重启 sing-box；任一步失败则恢复原文件
+# 用法同 json_edit：sb_commit <文件> [jq 参数...] '<过滤器>'
+sb_commit() {
+    local file="$1" bak="${1}.bak"
+    cp -f "$file" "$bak" || return 1
+    json_edit "$@" || { rm -f "$bak"; return 1; }
+    rebuild_config
+    if restart_sb; then
+        rm -f "$bak"
+        return 0
     fi
-    mv "$tmp" "$target"
+    mv -f "$bak" "$file"
+    rebuild_config && restart_sb >/dev/null
+    err "已撤销本次更改"
+    return 1
+}
+
+# ---- 通用输入 ----------------------------------------------------------------
+# 必填项：ask_required <名称> → stdout；为空返回 1
+ask_required() {
+    local v
+    read -rp "$(echo -e "${CYAN}请输入 $1: ${NC}")" v
+    [[ -n "$v" ]] || { err "$1 不能为空" >&2; return 1; }
+    printf '%s' "$v"
+}
+
+# 远端地址 + 端口 → "server|port"
+ask_server_port() {
+    local s p
+    s=$(ask_required "服务器地址 (IP 或域名)") || return 1
+    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" p
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )) || { err "端口无效" >&2; return 1; }
+    echo "${s}|${p}"
+}
+
+# 是否跳过证书验证 → true / false
+ask_insecure() {
+    local a
+    read -rp "$(echo -e "${CYAN}跳过证书验证? (自签证书选 y) [y/N]: ${NC}")" a
+    [[ "$a" =~ ^[Yy]$ ]] && echo true || echo false
+}
+
+# Shadowsocks 加密方式（入站 / 出站 / 客户端共用）
+SS_METHODS=(aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305
+            2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305)
+
+# 选择加密方式：pick_ss_method [all|legacy|2022] → stdout；取消或无效返回 1
+pick_ss_method() {
+    local filter="${1:-all}" m c i=0
+    local -a list=()
+    for m in "${SS_METHODS[@]}"; do
+        case "$filter" in
+            legacy) [[ "$m" == 2022-* ]] && continue ;;
+            2022)   [[ "$m" == 2022-* ]] || continue ;;
+        esac
+        list+=("$m")
+    done
+    echo "请选择加密方式:" >&2
+    for m in "${list[@]}"; do i=$((i+1)); echo "  ${i}) ${m}" >&2; done
+    echo "  0) 返回" >&2
+    read -rp "$(echo -e "${CYAN}请选择 [0-${i}]: ${NC}")" c
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= i )) || return 1
+    echo "${list[$((c-1))]}"
+}
+
+# 分流目标输入 "geosite:openai, claude.ai" → {"geosite":["openai"],"domain":["claude.ai"]}
+parse_rule_input() {
+    jq -cn --arg s "$1" '[$s | split(",")[] | gsub("\\s"; "") | select(length > 0)]
+        | {geosite: map(select(startswith("geosite:")) | ltrimstr("geosite:")),
+           domain:  map(select(startswith("geosite:") | not))}'
+}
+
+# 规则的可读描述：{"geosite":[..],"domain":[..]} → "geosite:x,a.com"
+rule_desc() {
+    jq -r '[(.geosite[]? | "geosite:\(.)"), .domain[]?] | join(",")' <<<"$1"
+}
+
+# 远程规则集定义：rule_sets_json <下载出口> <tag...>，tag 形如 geosite-xxx / geoip-xxx
+rule_sets_json() {
+    local detour="$1"
+    shift
+    printf '%s\n' "$@" | jq -Rs --arg d "$detour" '
+        split("\n") | map(select(length > 0)) | unique
+        | map((split("-")[0]) as $k | {
+            type:"remote", tag:., format:"binary", download_detour:$d,
+            url:"https://raw.githubusercontent.com/SagerNet/sing-\($k)/rule-set/\(.).srs"})'
 }
 
 # 生成不重复的节点 tag（改过端口的节点仍保留旧 tag，新节点可能撞名导致 sing-box 启动失败）
@@ -522,14 +605,13 @@ listen_addr() {
 }
 
 save_node() {
-    local tag="$1" proto="$2" port="$3" family="$4" remark="$5" link="$6" extra="$7"
+    local tag="$1" proto="$2" port="$3" family="$4" remark="$5" link="$6" extra="${7:-}"
     [[ -z "$extra" ]] && extra='{}'
-    atomic_write "$SB_NODES" jq \
+    json_edit "$SB_NODES" \
         --arg tag "$tag" --arg proto "$proto" --argjson port "$port" \
         --arg family "$family" --arg remark "$remark" --arg link "$link" \
         --argjson extra "$extra" \
-        '. += [{tag:$tag, protocol:$proto, port:$port, family:$family, remark:$remark, link:$link, extra:$extra, created:(now|todate)}]' \
-        "$SB_NODES"
+        '. += [{tag:$tag, protocol:$proto, port:$port, family:$family, remark:$remark, link:$link, extra:$extra, created:(now|todate)}]'
 }
 
 restart_sb() {
@@ -565,7 +647,7 @@ view_log() {
     fi
 }
 # =============================================================================
-# rebuild_config: 兼容 sing-box 1.13 的配置生成（Snell 节点需 1.14+）
+# rebuild_config: 兼容 sing-box 1.13 的配置生成（Snell 节点由官方 snell-server 独立运行，不在此配置中）
 # =============================================================================
 rebuild_config() {
     local tmp; tmp=$(mktemp --suffix=.json)
@@ -596,12 +678,7 @@ rebuild_config() {
 
     # 用户分流规则
     local user_rules
-    user_rules=$(jq '[.[] | {geosite:.geosite, domain:.domain, outbound:.outbound} |
-        {
-            rule_set:[(.geosite[]? | "geosite-\(.)")],
-            domain_list:(.domain // []),
-            outbound:.outbound
-        }]' "$SB_RULES")
+    user_rules=$(jq '[.[] | {rule_set:[(.geosite[]? | "geosite-\(.)")], domain_list:(.domain // []), outbound}]' "$SB_RULES")
 
     # 大陆屏蔽规则
     local cn_block_rule="[]"
@@ -609,32 +686,11 @@ rebuild_config() {
         cn_block_rule='[{"rule_set":["geosite-cn","geoip-cn"],"domain_list":[],"outbound":"block"}]'
     fi
 
-    # 收集 rule_set
-    local used_sets
-    used_sets=$(jq -nr \
-        --argjson u "$user_rules" \
-        --argjson c "$cn_block_rule" \
-        '[($u + $c) | .[] | .rule_set[]] | unique | .[]')
-
-    local rule_sets="[]"
-    if [[ -n "$used_sets" ]]; then
-        local rs_arr="[" first=1
-        while IFS= read -r tag; do
-            [[ -z "$tag" ]] && continue
-            local kind name url
-            kind="${tag%%-*}"; name="${tag#*-}"
-            if [[ "$kind" == "geosite" ]]; then
-                url="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-${name}.srs"
-            else
-                url="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-${name}.srs"
-            fi
-            [[ $first -eq 0 ]] && rs_arr+=","
-            rs_arr+="{\"type\":\"remote\",\"tag\":\"${tag}\",\"format\":\"binary\",\"url\":\"${url}\",\"download_detour\":\"direct\"}"
-            first=0
-        done <<< "$used_sets"
-        rs_arr+="]"
-        rule_sets="$rs_arr"
-    fi
+    # 用到的 geosite/geoip → 远程规则集
+    local rule_sets
+    # shellcheck disable=SC2046
+    rule_sets=$(rule_sets_json direct $(jq -nr --argjson u "$user_rules" --argjson c "$cn_block_rule" \
+        '($u + $c)[] | .rule_set[]'))
 
     # 构造 route.rules（顺序很重要）:
     # 1) sniff    —— 嗅探协议/域名。没有它，protocol:quic 永远匹配不到；
@@ -736,7 +792,7 @@ menu_new_proto() {
         echo
         echo "  3) AnyTLS"
         echo
-        echo "  4) Snell (v5 / v6)"
+        echo "  4) Snell (v4 / v5 / v6，官方服务端)"
         echo
         echo "  0) 返回上一页"
         hr
@@ -754,40 +810,19 @@ menu_new_proto() {
 }
 
 menu_ss_method() {
-    local family="$1"
-    local address_mode="${2:-ip}"
-    local node_address="${3:-}"
+    local method
     clear; show_banner
     sec "Shadowsocks → 选择加密方式"
-    echo "  1) aes-128-gcm"
-    echo "  2) aes-256-gcm"
-    echo "  3) chacha20-ietf-poly1305"
-    echo "  4) xchacha20-ietf-poly1305"
-    echo "  5) 2022-blake3-aes-128-gcm"
-    echo "  6) 2022-blake3-aes-256-gcm"
-    echo "  7) 2022-blake3-chacha20-poly1305"
-    echo "  0) 返回上一页"
-    hr
-    local c
-    read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" c
-    case "$c" in
-        1) create_ss "$family" "aes-128-gcm" 16 "$address_mode" "$node_address" ;;
-        2) create_ss "$family" "aes-256-gcm" 32 "$address_mode" "$node_address" ;;
-        3) create_ss "$family" "chacha20-ietf-poly1305" 32 "$address_mode" "$node_address" ;;
-        4) create_ss "$family" "xchacha20-ietf-poly1305" 32 "$address_mode" "$node_address" ;;
-        5) create_ss "$family" "2022-blake3-aes-128-gcm" 16 "$address_mode" "$node_address" ;;
-        6) create_ss "$family" "2022-blake3-aes-256-gcm" 32 "$address_mode" "$node_address" ;;
-        7) create_ss "$family" "2022-blake3-chacha20-poly1305" 32 "$address_mode" "$node_address" ;;
-        0|"") return ;;
-        *) err "无效选择"; sleep 1 ;;
-    esac
+    method=$(pick_ss_method all) || return
+    create_ss "$1" "$method" "${2:-ip}" "${3:-}"
 }
 
 create_ss() {
-    local family="$1" method="$2" keylen="$3"
-    local address_mode="${4:-ip}"
-    local node_address="${5:-}"
-    local is2022=0
+    local family="$1" method="$2"
+    local address_mode="${3:-ip}"
+    local node_address="${4:-}"
+    local keylen=32 is2022=0
+    [[ "$method" == *128* ]] && keylen=16
     [[ "$method" == 2022-* ]] && is2022=1
 
     local port pwd short_proto remark tag ip
@@ -953,7 +988,7 @@ create_reality() {
         echo
         # 客户端 brutal: up_mbps=客户端上行=服务端下行=brutal_up
         #               down_mbps=客户端下行=服务端上行=brutal_down
-        jq -n --arg tag "$remark" --arg srv "$(ip_for_url "$ip")" --argjson port "$port" \
+        jq -n --arg tag "$remark" --arg srv "$ip" --argjson port "$port" \
             --arg uuid "$uuid" --arg sni "$sni" --arg pbk "$pubkey" --arg sid "$shortid" \
             --argjson up "$brutal_up" --argjson down "$brutal_down" \
             '{type:"vless", tag:$tag, server:$srv, server_port:$port, uuid:$uuid,
@@ -1050,116 +1085,207 @@ create_anytls() {
 }
 
 # =============================================================================
-# Snell (sing-box ≥ 1.14 原生入站，无需额外安装 snell-server)
+# Snell（官方 snell-server，独立于 sing-box 运行）
 #
-# 节点 link 统一存为: snell://<psk>@<host>:<port>?version=..[&...]#<备注>
-#   与其他协议同为 "@host:port" 结构，因此「修改备注 / 修改端口 / 家宽换 IP /
-#   DDNS 换域名」等现有逻辑无需任何改动即可同步更新。
-#   展示时再由 snell_surge_line 把 link 转成 Surge 的 [Proxy] 配置行。
+#   v4 / v5 → snell-server v5（v5 服务端兼容 v4 客户端；v5 的 QUIC 代理需放行 UDP）
+#   v6      → snell-server v6（Beta，PSK 流量整形，无 obfs / QUIC 代理）
 #
-# 版本说明:
-#   v5: sing-box 有意不实现 v5 的 QUIC 代理模式，线路协议与 v4 相同，
-#       所以 Surge 端写 version=4（UDP 仍走 UDP over TCP）
-#   v6: Beta，PSK 派生流量整形，不支持 obfs，psk 需 12-255 字节
+# 每个节点一个 systemd 实例 snell<5|6>@<tag>，配置 /etc/snell/<tag>.conf。
+# 节点记录里 extra.unit 非空即表示由 snell-server 承载（不写 extra.inbound，
+# 所以不会进入 sing-box 配置）；配置文件参数全部存在 extra 中，随时可重建。
+#
+# link 存为 snell://<psk>@<host>:<port>?version=..#<备注>，仅供内部使用：
+# 与其他协议同为 "@host:port" 结构，改端口 / 改备注 / 换 IP / DDNS 同步直接复用；
+# 对外一律显示 Surge 配置行。
 # =============================================================================
-SNELL_MIN_SB="1.14.0"
+SNELL_DIR="/etc/snell"
+declare -A SNELL_BIN=([5]="/usr/local/bin/snell-server" [6]="/usr/local/bin/snell-server-v6")
+declare -A SNELL_VER=([5]="5.0.1" [6]="6.0.0rc2")
 
-# 当前 sing-box 版本是否 ≥ $1（预发布版按基础版本号比较）
-sb_version_ge() {
-    local need="$1" cur
-    cur=$("$SB_BIN" version 2>/dev/null | awk '/version/{print $3; exit}')
-    [[ -n "$cur" ]] || return 1
-    cur="${cur%%-*}"
-    [[ "$(printf '%s\n%s\n' "$need" "$cur" | sort -V | head -n1)" == "$need" ]]
+# 协议版本 → 服务端代数（v4 与 v5 共用 v5 服务端）
+snell_gen() { [[ "$1" == "6" ]] && echo 6 || echo 5; }
+
+# 安装官方 snell-server（含 systemd 模板单元）：install_snell_server <5|6>
+install_snell_server() {
+    local gen="$1" bin="${SNELL_BIN[$1]}" ver="${SNELL_VER[$1]}" arch tmp
+    local tpl="/etc/systemd/system/snell${gen}@.service"
+
+    if [[ ! -x "$bin" ]]; then
+        case "$(uname -m)" in
+            x86_64) arch="amd64" ;; aarch64) arch="aarch64" ;;
+            armv7l) arch="armv7l" ;; i386|i686) arch="i386" ;;
+            *) err "官方 snell-server 不支持此架构: $(uname -m)"; return 1 ;;
+        esac
+        [[ "$gen" == "6" && "$arch" == "armv7l" ]] && { err "官方 Snell v6 暂未提供 armv7l 版本"; return 1; }
+        command -v unzip >/dev/null 2>&1 || apt-get install -y unzip >/dev/null 2>&1 \
+            || { err "unzip 安装失败"; return 1; }
+
+        tmp=$(mktemp -d)
+        msg "下载官方 snell-server v${ver} (${arch})..."
+        if ! curl -fsSL "https://dl.nssurge.com/snell/snell-server-v${ver}-linux-${arch}.zip" -o "${tmp}/s.zip" \
+           || ! unzip -o -q "${tmp}/s.zip" -d "$tmp" \
+           || ! install -m 755 "${tmp}/snell-server" "$bin"; then
+            err "snell-server 下载或安装失败"; rm -rf "$tmp"; return 1
+        fi
+        rm -rf "$tmp"
+        ok "snell-server v${ver} 已安装"
+    fi
+
+    if [[ ! -f "$tpl" ]]; then
+        cat > "$tpl" <<UNIT
+[Unit]
+Description=Snell v${gen} server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nobody
+Group=nogroup
+ExecStart=${bin} -c ${SNELL_DIR}/%i.conf
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
+    mkdir -p "$SNELL_DIR"
 }
 
-# 确保 sing-box 支持 Snell；版本不够时询问是否升级
-ensure_snell_support() {
-    sb_version_ge "$SNELL_MIN_SB" && return 0
-    local cur ans
-    cur=$("$SB_BIN" version 2>/dev/null | awk '/version/{print $3; exit}')
-    warn "Snell 入站需要 sing-box ≥ ${SNELL_MIN_SB}，当前版本: ${cur:-未安装}"
-    read -rp "$(echo -e "${CYAN}是否立即更新 sing-box 到最新稳定版? [Y/n]: ${NC}")" ans
-    [[ "$ans" =~ ^[Nn]$ ]] && return 1
-    install_singbox force stable || return 1
-    if ! sb_version_ge "$SNELL_MIN_SB"; then
-        err "更新后版本仍低于 ${SNELL_MIN_SB}，最新稳定版可能尚未包含 Snell，可尝试 sing-box 管理 → 9) 测试版"
-        return 1
+# 按 nodes.json 第 idx 个节点生成配置并（重）启实例；失败打印日志
+snell_sync_idx() {
+    local idx="$1" tag ver family port psk obfs mode unit listen strategy
+    IFS=$'\t' read -r tag ver family port psk obfs mode unit < <(jq -r --argjson i "$idx" \
+        '.[$i] | [.tag, .extra.version, .family, .port, .extra.psk,
+                  (.extra.obfs // "none"), (.extra.mode // "default"), .extra.unit] | map(tostring) | @tsv' "$SB_NODES")
+
+    if [[ "$family" == "6" ]]; then
+        [[ "$ver" == "6" ]] && listen="[::]:${port}" || listen="::0:${port}"
+    else
+        listen="0.0.0.0:${port}"
     fi
-    # 先用现有配置重启一次，确认旧节点在新版本下正常，再继续添加
-    restart_sb || { err "新版本 sing-box 无法加载现有配置，请先处理上面的错误"; return 1; }
+    {
+        echo "[snell-server]"
+        echo "listen = ${listen}"
+        echo "psk = ${psk}"
+        # 出口 IPv4/IPv6 跟随全局策略（与监听用 v4 还是 v6 无关）
+        strategy=$(jq -r '.ip_strategy // "prefer_ipv4"' "$SB_SETTINGS")
+        if [[ "$ver" == "6" ]]; then
+            echo "ipv6 = $([[ "$strategy" == "ipv4_only" ]] && echo false || echo true)"
+            echo "dns-ip-preference = ${strategy//_/-}"
+            [[ "$mode" != "default" ]] && echo "mode = ${mode}"
+        else
+            # v5 只有 ipv6 开关：仅当策略偏向 IPv6 时才允许 IPv6 出口
+            echo "ipv6 = $([[ "$strategy" == *ipv6* ]] && echo true || echo false)"
+            [[ "$obfs" == "http" ]] && echo "obfs = http"
+        fi
+    } > "${SNELL_DIR}/${tag}.conf"
+    chown root:nogroup "${SNELL_DIR}/${tag}.conf" 2>/dev/null
+    chmod 640 "${SNELL_DIR}/${tag}.conf"
+
+    systemctl enable "$unit" >/dev/null 2>&1
+    systemctl restart "$unit"
+    sleep 1
+    systemctl is-active --quiet "$unit" && return 0
+    err "${unit} 启动失败:"
+    journalctl -u "$unit" -n 10 --no-pager | tail -n 10
+    return 1
+}
+
+# 全部 snell-server 节点按当前设置重新生成配置并重启（切换 IP 策略后调用）
+snell_sync_all() {
+    local i
+    for i in $(jq -r 'to_entries[] | select(.value.extra.unit) | .key' "$SB_NODES"); do
+        snell_sync_idx "$i" || warn "第 $((i+1)) 个节点的 snell-server 重启失败"
+    done
+}
+
+# 停止并清理某个实例：snell_remove_unit <unit> <tag>
+snell_remove_unit() {
+    systemctl disable --now "$1" >/dev/null 2>&1
+    rm -f "${SNELL_DIR}/${2}.conf"
+}
+
+# 卸载时清理全部官方 snell-server
+snell_uninstall_all() {
+    local u
+    for u in $( { jq -r '.[].extra.unit // empty' "$SB_NODES" 2>/dev/null
+                  systemctl list-units --all --plain --no-legend 'snell5@*' 'snell6@*' 2>/dev/null | awk '{print $1}'
+                } | sort -u ); do
+        systemctl disable --now "$u" >/dev/null 2>&1
+    done
+    rm -f /etc/systemd/system/snell5@.service /etc/systemd/system/snell6@.service \
+          "${SNELL_BIN[5]}" "${SNELL_BIN[6]}"
+    rm -rf "$SNELL_DIR"
+    systemctl daemon-reload
 }
 
 # 百分号解码（配合 urlencode 使用）
-urldecode() {
-    printf '%b' "${1//%/\\x}"
-}
+urldecode() { printf '%b' "${1//%/\\x}"; }
 
-# snell:// link → Surge [Proxy] 配置行
+# 内部 snell:// link → Surge [Proxy] 配置行
 snell_surge_line() {
-    local body="${1#snell://}" query="" frag="" psk hostport host port name
+    local body="${1#snell://}" query="" frag="" psk hostport host port name kv
     [[ "$body" == *"#"* ]] && { frag="${body#*#}"; body="${body%%#*}"; }
     [[ "$body" == *"?"* ]] && { query="${body#*\?}"; body="${body%%\?*}"; }
-    psk="${body%@*}"
-    hostport="${body##*@}"
-    port="${hostport##*:}"
-    host="${hostport%:*}"
-    host="${host#[}"; host="${host%]}"          # Surge 中 IPv6 不加方括号
+    psk="${body%@*}"; hostport="${body##*@}"
+    port="${hostport##*:}"; host="${hostport%:*}"
+    host="${host#[}"; host="${host%]}"            # Surge 中 IPv6 不加方括号
 
-    # Surge 策略名里的 , 和 = 会破坏配置行解析，替换掉
     name=$(urldecode "$frag")
-    name="${name//,/-}"; name="${name//=/-}"
-    [[ -z "$name" ]] && name="Snell"
-
-    local line="${name} = snell, ${host}, ${port}, psk=${psk}"
-    local kv k v
+    name="${name//,/-}"; name="${name//=/-}"      # , 和 = 会破坏 Surge 配置行
+    local line="${name:-Snell} = snell, ${host}, ${port}, psk=${psk}"
     local -a pairs=()
     [[ -n "$query" ]] && IFS='&' read -ra pairs <<< "$query"
     for kv in "${pairs[@]}"; do
-        k="${kv%%=*}"; v=$(urldecode "${kv#*=}")
-        case "$k" in
-            version|obfs|obfs-host|mode) line+=", ${k}=${v}" ;;
-        esac
+        line+=", ${kv%%=*}=$(urldecode "${kv#*=}")"
     done
     echo "${line}, reuse=true"
 }
 
 menu_snell_version() {
-    local family="$1"
-    local address_mode="${2:-ip}"
-    local node_address="${3:-}"
+    local family="$1" address_mode="${2:-ip}" node_address="${3:-}" c
     clear; show_banner
-    sec "Snell → 选择协议版本"
-    echo "  1) Snell v5  (稳定，推荐；Surge 端按 v4 连接，无 QUIC 代理模式)"
+    sec "Snell → 选择协议版本 (官方 snell-server)"
+    echo "  1) Snell v4  (无 QUIC 代理)"
     echo
-    echo "  2) Snell v6  (Beta，PSK 流量整形；需 Surge iOS 5.20+ / Mac 6.7+)"
+    echo "  2) Snell v5  (支持 QUIC 代理，需放行 UDP)"
+    echo
+    echo "  3) Snell v6  (Beta，PSK 流量整形；需 Surge iOS 5.20+ / Mac 6.7+)"
     echo
     echo "  0) 返回上一页"
     hr
-    local c
-    read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
+    read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
     case "$c" in
-        1) create_snell "$family" 5 "$address_mode" "$node_address" ;;
-        2) create_snell "$family" 6 "$address_mode" "$node_address" ;;
+        1|2|3) create_snell "$family" $((c + 3)) "$address_mode" "$node_address" ;;
         0|"") return ;;
         *) err "无效选择"; sleep 1 ;;
     esac
 }
 
 create_snell() {
-    local family="$1" ver="$2"
-    local address_mode="${3:-ip}"
-    local node_address="${4:-}"
-
-    ensure_snell_support || { pause; return; }
+    local family="$1" ver="$2" address_mode="${3:-ip}" node_address="${4:-}"
+    local gen; gen=$(snell_gen "$ver")
+    install_snell_server "$gen" || { pause; return; }
 
     local port
     port=$(ask_port "请输入端口" "$(random_port)") || { pause; return; }
 
-    # 版本专属参数：v5 → HTTP 混淆；v6 → 流量整形模式
+    # 版本专属参数：v4/v5 → HTTP 混淆；v6 → 流量整形模式
     local obfs="none" obfs_host="" mode="default" c
     echo
-    if [[ "$ver" == "5" ]]; then
+    if [[ "$ver" == "6" ]]; then
+        echo "请选择流量整形模式:"
+        echo "  1) default   (加密 + 流量整形，推荐)"
+        echo "  2) unshaped  (仅加密，关闭整形，吞吐约高 10%)"
+        read -rp "$(echo -e "${CYAN}请选择 [1-2，默认 1]: ${NC}")" c
+        case "${c:-1}" in
+            1) ;; 2) mode="unshaped" ;;
+            *) err "无效选择"; pause; return ;;
+        esac
+    else
         echo "请选择混淆方式:"
         echo "  1) 不混淆   (推荐)"
         echo "  2) HTTP 混淆"
@@ -1171,70 +1297,41 @@ create_snell() {
                obfs_host="${obfs_host:-bing.com}" ;;
             *) err "无效选择"; pause; return ;;
         esac
-    else
-        echo "请选择流量整形模式:"
-        echo "  1) default   (加密 + 流量整形，推荐)"
-        echo "  2) unshaped  (仅加密，关闭流量整形)"
-        read -rp "$(echo -e "${CYAN}请选择 [1-2，默认 1]: ${NC}")" c
-        case "${c:-1}" in
-            1) mode="default" ;;
-            2) mode="unshaped" ;;
-            *) err "无效选择"; pause; return ;;
-        esac
     fi
 
-    local remark tag psk
+    local remark tag psk ip unit
     remark=$(ask_remark "snell-v${ver}-${port}")
     tag=$(unique_node_tag "snell-v${ver}-${port}")
-    # 32 位十六进制：满足 v6 的 12-255 字节要求，且无需在 link / Surge 配置中转义
-    psk=$(openssl rand -hex 16)
-
-    local ip listen
+    unit="snell${gen}@${tag}"
+    psk=$(openssl rand -hex 16)     # 32 位十六进制：满足 v6 要求，配置行中无需转义
     ip=$(get_node_address "$family" "$address_mode" "$node_address")
     [[ -z "$ip" ]] && { err "无法获取所选连接地址，请检查公网 IP 或 DDNS 配置"; pause; return; }
-    listen=$(listen_addr "$family")
 
-    local inbound query
-    if [[ "$ver" == "5" ]]; then
-        inbound=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
-            --arg psk "$psk" --arg obfs "$obfs" \
-            '{type:"snell", tag:$tag, listen:$listen, listen_port:$port,
-              version:5, psk:$psk, obfs_mode:$obfs}')
-        # 客户端按 v4 连接（见上方版本说明）
-        query="version=4"
-        [[ "$obfs" == "http" ]] && query+="&obfs=http&obfs-host=$(urlencode "$obfs_host")"
-    else
-        inbound=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
-            --arg psk "$psk" --arg mode "$mode" \
-            '{type:"snell", tag:$tag, listen:$listen, listen_port:$port,
-              version:6, psk:$psk, mode:$mode}')
-        query="version=6"
-        [[ "$mode" != "default" ]] && query+="&mode=${mode}"
-    fi
-
-    local link
-    link="snell://${psk}@$(ip_for_url "$ip"):${port}?${query}#$(urlencode "$remark")"
+    local query="version=${ver}"
+    [[ "$obfs" == "http" ]] && query+="&obfs=http&obfs-host=$(urlencode "$obfs_host")"
+    [[ "$mode" != "default" ]] && query+="&mode=${mode}"
+    local link="snell://${psk}@$(ip_for_url "$ip"):${port}?${query}#$(urlencode "$remark")"
 
     save_node "$tag" "snell-v${ver}" "$port" "$family" "$remark" "$link" \
-        "$(jq -n --argjson ib "$inbound" --arg psk "$psk" --argjson ver "$ver" \
-            --arg obfs "$obfs" --arg obfs_host "$obfs_host" --arg mode "$mode" \
-            '{inbound:$ib, psk:$psk, version:$ver, obfs:$obfs, obfs_host:$obfs_host, mode:$mode}')"
-    rebuild_config
-    restart_sb || return
+        "$(jq -n --arg unit "$unit" --arg psk "$psk" --argjson ver "$ver" --arg obfs "$obfs" --arg mode "$mode" \
+            '{unit:$unit, psk:$psk, version:$ver, obfs:$obfs, mode:$mode}')" || { pause; return; }
+
+    # 启动失败则回滚：删实例、删刚写入的节点
+    if ! snell_sync_idx "$(( $(jq 'length' "$SB_NODES") - 1 ))"; then
+        snell_remove_unit "$unit" "$tag"
+        json_edit "$SB_NODES" 'del(.[-1])'
+        pause; return
+    fi
 
     echo
     ok "节点创建成功: ${remark}"
-    echo -e "${BOLD}Surge 配置 ([Proxy] 段):${NC}"
+    echo -e "${BOLD}节点配置 (整行复制到 Sub-Store / Surge):${NC}"
     echo -e "${GREEN}$(snell_surge_line "$link")${NC}"
     echo
-    echo -e "${BOLD}节点链接 (备份 / 部分客户端可导入):${NC}"
-    echo -e "${GREEN}${link}${NC}"
-    echo
-    if [[ "$ver" == "5" ]]; then
-        warn "Surge 中请保持 version=4：sing-box 未实现 v5 的 QUIC 代理模式，改成 5 后 HTTP/3 流量可能异常"
-    else
-        warn "Snell v6 仍为 Beta，协议可能变动；升级 Surge 时请同步更新 sing-box"
-    fi
+    case "$ver" in
+        5) warn "v5 的 QUIC 代理走 UDP：防火墙 / 安全组 / 中转机都要同时放行 ${port} 的 TCP 和 UDP" ;;
+        6) warn "Snell v6 仍是 Beta：以后升级 Surge 时，记得同时更新服务端" ;;
+    esac
     pause
 }
 
@@ -1286,14 +1383,20 @@ view_nodes() {
         warn "暂无节点"
     else
         local i=0
-        while IFS=$'\t' read -r tag remark proto port family link; do
+        while IFS=$'\t' read -r tag remark proto port family link unit; do
             i=$((i+1))
             echo -e "${BOLD}[${i}] ${remark}${NC} ${YELLOW}(${tag})${NC}"
             echo -e "    协议: ${proto}    端口: ${port}    IPv${family}"
-            echo -e "    ${GREEN}${link}${NC}"
-            [[ "$proto" == snell-* ]] && echo -e "    Surge: ${GREEN}$(snell_surge_line "$link")${NC}"
+            if [[ "$link" == snell://* ]]; then
+                echo -e "    ${GREEN}$(snell_surge_line "$link")${NC}"
+                if [[ -n "$unit" ]] && ! systemctl is-active --quiet "$unit"; then
+                    echo -e "    ${RED}snell-server 未运行${NC} (journalctl -u ${unit} 查看原因)"
+                fi
+            else
+                echo -e "    ${GREEN}${link}${NC}"
+            fi
             echo
-        done < <(jq -r '.[] | [.tag, .remark, .protocol, .port, .family, .link] | @tsv' "$SB_NODES")
+        done < <(jq -r '.[] | [.tag, .remark, .protocol, .port, .family, .link, (.extra.unit // "")] | @tsv' "$SB_NODES")
     fi
     hr
     pause
@@ -1328,10 +1431,16 @@ delete_node() {
         read -rp "$(echo -e "${YELLOW}确定删除 ${remark} (端口 ${port})? [y/N]: ${NC}")" y
         [[ "$y" =~ ^[Yy]$ ]] || continue
         [[ -f "${SB_CERT_DIR}/${tag}.crt" ]] && rm -f "${SB_CERT_DIR}/${tag}.crt" "${SB_CERT_DIR}/${tag}.key"
-        local tmp; tmp=$(mktemp)
-        jq "del(.[${idx}])" "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
-        rebuild_config
-        restart_sb && ok "已删除 ${remark}"
+        local unit; unit=$(jq -r ".[${idx}].extra.unit // empty" "$SB_NODES")
+        json_edit "$SB_NODES" --argjson i "$idx" 'del(.[$i])' || { pause; continue; }
+        if [[ -n "$unit" ]]; then
+            # 官方 snell-server 节点：只停它自己的实例，不动 sing-box
+            snell_remove_unit "$unit" "$tag"
+            ok "已删除 ${remark}"
+        else
+            rebuild_config
+            restart_sb && ok "已删除 ${remark}"
+        fi
         sleep 1
     done
 }
@@ -1377,8 +1486,11 @@ modify_node_detail() {
         echo "  协议: ${proto}"
         echo "  端口: ${port}"
         echo "  出口: IPv${family}"
-        echo -e "  链接: ${GREEN}${link}${NC}"
-        [[ "$proto" == snell-* ]] && echo -e "  Surge: ${GREEN}$(snell_surge_line "$link")${NC}"
+        if [[ "$link" == snell://* ]]; then
+            echo -e "  配置: ${GREEN}$(snell_surge_line "$link")${NC}"
+        else
+            echo -e "  链接: ${GREEN}${link}${NC}"
+        fi
         hr
         echo "  1) 修改备注"
         echo "  2) 修改端口"
@@ -1396,19 +1508,13 @@ modify_node_detail() {
 }
 
 modify_remark() {
-    local idx="$1"
-    local old new
+    local idx="$1" old new
     old=$(jq -r ".[${idx}].remark" "$SB_NODES")
     read -rp "$(echo -e "${CYAN}请输入新备注 (当前: ${old}): ${NC}")" new
     [[ -z "$new" ]] && return
-    local tmp; tmp=$(mktemp)
-    jq --arg r "$new" ".[${idx}].remark = \$r" "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
-    local link new_link
-    link=$(jq -r ".[${idx}].link" "$SB_NODES")
-    new_link="${link%#*}#$(urlencode "$new")"
-    tmp=$(mktemp)
-    jq --arg l "$new_link" ".[${idx}].link = \$l" "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
-    ok "备注已更新"
+    # 链接 # 后面是备注，一并更新
+    json_edit "$SB_NODES" --argjson i "$idx" --arg r "$new" --arg e "$(urlencode "$new")" \
+        '.[$i].remark = $r | .[$i].link |= (split("#")[0] + "#" + $e)' && ok "备注已更新"
     sleep 1
 }
 
@@ -1418,11 +1524,10 @@ modify_port() {
     old=$(jq -r ".[${idx}].port" "$SB_NODES")
     new=$(ask_port_exclude "请输入新端口 (当前 ${old})" "$old" "$old") || { pause; return; }
 
-    # 更新 port 和 inbound.listen_port
-    local tmp; tmp=$(mktemp)
-    jq --argjson p "$new" \
-       ".[${idx}].port = \$p | .[${idx}].extra.inbound.listen_port = \$p" \
-       "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
+    # 更新 port 和 inbound.listen_port（snell-server 节点没有 inbound）
+    json_edit "$SB_NODES" --argjson p "$new" --argjson i "$idx" \
+       '.[$i].port = $p | if .[$i].extra.inbound then .[$i].extra.inbound.listen_port = $p else . end' \
+       || { pause; return; }
 
     # 重新生成 link：解析旧 link，替换 host 后的 port
     # 注意：host 可能是 IPv4 / [IPv6] / 域名；port 后面可能是 / 或 ? 或 # 或字符串结束
@@ -1474,10 +1579,13 @@ modify_port() {
         }
     ' <<< "$link")
 
-    tmp=$(mktemp)
-    jq --arg l "$new_link" ".[${idx}].link = \$l" "$SB_NODES" > "$tmp" && mv "$tmp" "$SB_NODES"
-    rebuild_config
-    restart_sb && ok "端口已改为 ${new}"
+    json_edit "$SB_NODES" --argjson i "$idx" --arg l "$new_link" '.[$i].link = $l'
+    if [[ -n "$(jq -r ".[${idx}].extra.unit // empty" "$SB_NODES")" ]]; then
+        snell_sync_idx "$idx" && ok "端口已改为 ${new}"
+    else
+        rebuild_config
+        restart_sb && ok "端口已改为 ${new}"
+    fi
     sleep 1
 }
 # =============================================================================
@@ -1502,10 +1610,10 @@ add_outbound() {
         1) ob_shadowsocks ;;
         2) ob_vless_reality ;;
         3) ob_vless_ws_tls ;;
-        4) ob_hysteria2 ;;
+        4) ob_password_tls hysteria2 "Hysteria2-Out" ;;
         5) ob_tuic ;;
-        6) ob_trojan ;;
-        7) ob_anytls ;;
+        6) ob_password_tls trojan "Trojan-Out" ;;
+        7) ob_password_tls anytls "AnyTLS-Out" ;;
         8) ob_socks5 ;;
         0|"") return ;;
         *) err "无效选择"; sleep 1 ;;
@@ -1536,242 +1644,89 @@ ask_ob_tag() {
     done
 }
 
-# 公共：保存出站
+# 公共：保存出站（失败自动回滚）
 save_outbound() {
     local tag="$1" proto="$2" outbound="$3"
-    local tmp; tmp=$(mktemp)
-    jq --arg tag "$tag" --arg proto "$proto" --argjson ob "$outbound" \
-       '. += [{tag:$tag, protocol:$proto, outbound:$ob}]' \
-       "$SB_OUTBOUNDS" > "$tmp" && mv "$tmp" "$SB_OUTBOUNDS"
-    rebuild_config
-    if restart_sb; then
-        ok "已添加出口: ${tag}"
-    else
-        err "添加失败，已回滚"
-        tmp=$(mktemp)
-        jq 'del(.[-1])' "$SB_OUTBOUNDS" > "$tmp" && mv "$tmp" "$SB_OUTBOUNDS"
-        rebuild_config
-        restart_sb
-    fi
+    sb_commit "$SB_OUTBOUNDS" --arg tag "$tag" --arg proto "$proto" --argjson ob "$outbound" \
+        '. += [{tag:$tag, protocol:$proto, outbound:$ob}]' && ok "已添加出口: ${tag}"
     pause
 }
 
-# ---------- Shadowsocks ----------
+# 以下各协议：先收集参数，任一必填项为空即取消；server/port 由 ask_server_port 统一校验
 ob_shadowsocks() {
-    local tag; tag=$(ask_ob_tag "Shadowsocks-Out")
-    local server port pwd
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入密码: ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空"; pause; return; }
-
+    local tag sp pwd method
+    tag=$(ask_ob_tag "Shadowsocks-Out")
+    sp=$(ask_server_port) && pwd=$(ask_required "密码") || { pause; return; }
     echo
-    echo "请选择加密方式:"
-    echo "  1. aes-128-gcm"
-    echo "  2. aes-256-gcm"
-    echo "  3. chacha20-ietf-poly1305"
-    echo "  4. xchacha20-ietf-poly1305"
-    echo "  5. 2022-blake3-aes-128-gcm"
-    echo "  6. 2022-blake3-aes-256-gcm"
-    echo "  7. 2022-blake3-chacha20-poly1305"
-    echo "  0. 返回"
-    local mc method
-    read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" mc
-    case "$mc" in
-        1) method="aes-128-gcm" ;;
-        2) method="aes-256-gcm" ;;
-        3) method="chacha20-ietf-poly1305" ;;
-        4) method="xchacha20-ietf-poly1305" ;;
-        5) method="2022-blake3-aes-128-gcm" ;;
-        6) method="2022-blake3-aes-256-gcm" ;;
-        7) method="2022-blake3-chacha20-poly1305" ;;
-        0|"") return ;;
-        *) err "无效"; pause; return ;;
-    esac
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
+    method=$(pick_ss_method all) || return
+    save_outbound "$tag" "shadowsocks" "$(jq -n --arg tag "$tag" --arg s "${sp%|*}" --argjson p "${sp#*|}" \
         --arg m "$method" --arg pw "$pwd" \
-        '{type:"shadowsocks", tag:$tag, server:$s, server_port:$p, method:$m, password:$pw}')
-    save_outbound "$tag" "shadowsocks" "$outbound"
+        '{type:"shadowsocks", tag:$tag, server:$s, server_port:$p, method:$m, password:$pw}')"
 }
 
-# ---------- VLESS Reality ----------
 ob_vless_reality() {
-    local tag; tag=$(ask_ob_tag "Reality-Out")
-    local server port uuid sni pbk sid fp
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 UUID: ${NC}")" uuid
-    [[ -z "$uuid" ]] && { err "UUID 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 SNI: ${NC}")" sni
-    [[ -z "$sni" ]] && { err "SNI 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 Reality public_key (pbk): ${NC}")" pbk
-    [[ -z "$pbk" ]] && { err "pbk 不能为空"; pause; return; }
+    local tag sp uuid sni pbk sid fp
+    tag=$(ask_ob_tag "Reality-Out")
+    sp=$(ask_server_port) && uuid=$(ask_required "UUID") && sni=$(ask_required "SNI") \
+        && pbk=$(ask_required "Reality public_key (pbk)") || { pause; return; }
     read -rp "$(echo -e "${CYAN}请输入 short_id (sid): ${NC}")" sid
     read -rp "$(echo -e "${CYAN}请输入指纹 fingerprint (回车默认 chrome): ${NC}")" fp
-    fp="${fp:-chrome}"
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-        --arg u "$uuid" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" \
+    save_outbound "$tag" "vless-reality" "$(jq -n --arg tag "$tag" --arg s "${sp%|*}" --argjson p "${sp#*|}" \
+        --arg u "$uuid" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-chrome}" \
         '{type:"vless", tag:$tag, server:$s, server_port:$p, uuid:$u, flow:"xtls-rprx-vision",
           tls:{enabled:true, server_name:$sni,
             utls:{enabled:true, fingerprint:$fp},
-            reality:{enabled:true, public_key:$pbk, short_id:$sid}}}')
-    save_outbound "$tag" "vless-reality" "$outbound"
+            reality:{enabled:true, public_key:$pbk, short_id:$sid}}}')"
 }
 
-# ---------- VLESS WS TLS ----------
 ob_vless_ws_tls() {
-    local tag; tag=$(ask_ob_tag "VLESS-WS-Out")
-    local server port uuid sni path host
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口 (通常 443): ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 UUID: ${NC}")" uuid
-    [[ -z "$uuid" ]] && { err "UUID 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 SNI: ${NC}")" sni
-    [[ -z "$sni" ]] && { err "SNI 不能为空"; pause; return; }
+    local tag sp uuid sni path host
+    tag=$(ask_ob_tag "VLESS-WS-Out")
+    sp=$(ask_server_port) && uuid=$(ask_required "UUID") && sni=$(ask_required "SNI") || { pause; return; }
     read -rp "$(echo -e "${CYAN}请输入 WS path (回车默认 /): ${NC}")" path
-    path="${path:-/}"
     read -rp "$(echo -e "${CYAN}请输入 WS Host (回车默认与 SNI 相同): ${NC}")" host
-    host="${host:-$sni}"
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-        --arg u "$uuid" --arg sni "$sni" --arg path "$path" --arg host "$host" \
+    save_outbound "$tag" "vless-ws-tls" "$(jq -n --arg tag "$tag" --arg s "${sp%|*}" --argjson p "${sp#*|}" \
+        --arg u "$uuid" --arg sni "$sni" --arg path "${path:-/}" --arg host "${host:-$sni}" \
         '{type:"vless", tag:$tag, server:$s, server_port:$p, uuid:$u,
           tls:{enabled:true, server_name:$sni},
-          transport:{type:"ws", path:$path, headers:{Host:$host}}}')
-    save_outbound "$tag" "vless-ws-tls" "$outbound"
+          transport:{type:"ws", path:$path, headers:{Host:$host}}}')"
 }
 
-# ---------- Hysteria2 ----------
-ob_hysteria2() {
-    local tag; tag=$(ask_ob_tag "Hysteria2-Out")
-    local server port pwd sni insec
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入密码: ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 SNI: ${NC}")" sni
-    [[ -z "$sni" ]] && { err "SNI 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}跳过证书验证? [y/N]: ${NC}")" insec
-    local insec_bool=false
-    [[ "$insec" =~ ^[Yy]$ ]] && insec_bool=true
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-        --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insec_bool" \
-        '{type:"hysteria2", tag:$tag, server:$s, server_port:$p, password:$pw,
-          tls:{enabled:true, server_name:$sni, insecure:$insec}}')
-    save_outbound "$tag" "hysteria2" "$outbound"
+# Hysteria2 / Trojan / AnyTLS：参数结构相同（密码 + TLS）
+ob_password_tls() {
+    local type="$1" tag sp pwd sni insec
+    tag=$(ask_ob_tag "$2")
+    sp=$(ask_server_port) && pwd=$(ask_required "密码") && sni=$(ask_required "SNI") || { pause; return; }
+    insec=$(ask_insecure)
+    save_outbound "$tag" "$type" "$(jq -n --arg type "$type" --arg tag "$tag" --arg s "${sp%|*}" --argjson p "${sp#*|}" \
+        --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insec" \
+        '{type:$type, tag:$tag, server:$s, server_port:$p, password:$pw,
+          tls:{enabled:true, server_name:$sni, insecure:$insec}}')"
 }
 
-# ---------- TUIC v5 ----------
 ob_tuic() {
-    local tag; tag=$(ask_ob_tag "TUIC-Out")
-    local server port uuid pwd sni insec
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 UUID: ${NC}")" uuid
-    [[ -z "$uuid" ]] && { err "UUID 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入密码: ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 SNI: ${NC}")" sni
-    [[ -z "$sni" ]] && { err "SNI 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}跳过证书验证? [y/N]: ${NC}")" insec
-    local insec_bool=false
-    [[ "$insec" =~ ^[Yy]$ ]] && insec_bool=true
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-        --arg u "$uuid" --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insec_bool" \
+    local tag sp uuid pwd sni insec
+    tag=$(ask_ob_tag "TUIC-Out")
+    sp=$(ask_server_port) && uuid=$(ask_required "UUID") && pwd=$(ask_required "密码") \
+        && sni=$(ask_required "SNI") || { pause; return; }
+    insec=$(ask_insecure)
+    save_outbound "$tag" "tuic" "$(jq -n --arg tag "$tag" --arg s "${sp%|*}" --argjson p "${sp#*|}" \
+        --arg u "$uuid" --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insec" \
         '{type:"tuic", tag:$tag, server:$s, server_port:$p, uuid:$u, password:$pw,
           congestion_control:"bbr",
-          tls:{enabled:true, server_name:$sni, insecure:$insec, alpn:["h3"]}}')
-    save_outbound "$tag" "tuic" "$outbound"
+          tls:{enabled:true, server_name:$sni, insecure:$insec, alpn:["h3"]}}')"
 }
 
-# ---------- Trojan ----------
-ob_trojan() {
-    local tag; tag=$(ask_ob_tag "Trojan-Out")
-    local server port pwd sni insec
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口 (通常 443): ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入密码: ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 SNI: ${NC}")" sni
-    [[ -z "$sni" ]] && { err "SNI 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}跳过证书验证? [y/N]: ${NC}")" insec
-    local insec_bool=false
-    [[ "$insec" =~ ^[Yy]$ ]] && insec_bool=true
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-        --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insec_bool" \
-        '{type:"trojan", tag:$tag, server:$s, server_port:$p, password:$pw,
-          tls:{enabled:true, server_name:$sni, insecure:$insec}}')
-    save_outbound "$tag" "trojan" "$outbound"
-}
-
-# ---------- AnyTLS ----------
-ob_anytls() {
-    local tag; tag=$(ask_ob_tag "AnyTLS-Out")
-    local server port pwd sni insec
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入密码: ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入 SNI: ${NC}")" sni
-    [[ -z "$sni" ]] && { err "SNI 不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}跳过证书验证? [y/N]: ${NC}")" insec
-    local insec_bool=false
-    [[ "$insec" =~ ^[Yy]$ ]] && insec_bool=true
-
-    local outbound
-    outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-        --arg pw "$pwd" --arg sni "$sni" --argjson insec "$insec_bool" \
-        '{type:"anytls", tag:$tag, server:$s, server_port:$p, password:$pw,
-          tls:{enabled:true, server_name:$sni, insecure:$insec}}')
-    save_outbound "$tag" "anytls" "$outbound"
-}
-
-# ---------- Socks5 ----------
 ob_socks5() {
-    local tag; tag=$(ask_ob_tag "Socks5-Out")
-    local server port user pwd
-    read -rp "$(echo -e "${CYAN}请输入服务器 IP/域名: ${NC}")" server
-    [[ -z "$server" ]] && { err "不能为空"; pause; return; }
-    read -rp "$(echo -e "${CYAN}请输入端口: ${NC}")" port
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { err "端口无效"; pause; return; }
+    local tag sp user pwd
+    tag=$(ask_ob_tag "Socks5-Out")
+    sp=$(ask_server_port) || { pause; return; }
     read -rp "$(echo -e "${CYAN}请输入用户名 (无认证则回车): ${NC}")" user
     read -rp "$(echo -e "${CYAN}请输入密码 (无认证则回车): ${NC}")" pwd
-
-    local outbound
-    if [[ -n "$user" ]]; then
-        outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-            --arg u "$user" --arg pw "$pwd" \
-            '{type:"socks", tag:$tag, server:$s, server_port:$p, version:"5", username:$u, password:$pw}')
-    else
-        outbound=$(jq -n --arg tag "$tag" --arg s "$server" --argjson p "$port" \
-            '{type:"socks", tag:$tag, server:$s, server_port:$p, version:"5"}')
-    fi
-    save_outbound "$tag" "socks5" "$outbound"
+    save_outbound "$tag" "socks5" "$(jq -n --arg tag "$tag" --arg s "${sp%|*}" --argjson p "${sp#*|}" \
+        --arg u "$user" --arg pw "$pwd" \
+        '{type:"socks", tag:$tag, server:$s, server_port:$p, version:"5"}
+         + (if $u != "" then {username:$u, password:$pw} else {} end)')"
 }
 
 # ---------- 添加分流规则 ----------
@@ -1779,29 +1734,11 @@ add_rule() {
     clear; show_banner
     sub "添加分流规则"
     echo
-
-    read -rp "$(echo -e "${CYAN}请输入目标域名 (多个用逗号分隔，支持 geosite:xxx): ${NC}")" rules_input
-    [[ -z "$rules_input" ]] && return
-
-    local geosite_arr="[]" domain_arr="[]"
-    local IFS=','
-    local item
-    for item in $rules_input; do
-        item="${item// /}"
-        [[ -z "$item" ]] && continue
-        if [[ "$item" == geosite:* ]]; then
-            local name="${item#geosite:}"
-            geosite_arr=$(echo "$geosite_arr" | jq --arg n "$name" '. + [$n]')
-        else
-            # 当作域名后缀处理
-            domain_arr=$(echo "$domain_arr" | jq --arg n "$item" '. + [$n]')
-        fi
-    done
-    unset IFS
-
-    if [[ "$(echo "$geosite_arr" | jq 'length')" == "0" && "$(echo "$domain_arr" | jq 'length')" == "0" ]]; then
-        err "没有有效规则"; pause; return
-    fi
+    local input match
+    read -rp "$(echo -e "${CYAN}请输入目标域名 (多个用逗号分隔，支持 geosite:xxx): ${NC}")" input
+    [[ -z "$input" ]] && return
+    match=$(parse_rule_input "$input")
+    jq -e '(.geosite + .domain) | length > 0' <<<"$match" >/dev/null || { err "没有有效规则"; pause; return; }
 
     echo
     echo -e "${CYAN}请选择流量去向 (Target Outbound):${NC}"
@@ -1809,111 +1746,47 @@ add_rule() {
     echo "  2. block           (内置-屏蔽)"
     echo "  3. ipv4-out        (内置-IPv4 直连)"
     echo "  4. ipv6-out        (内置-IPv6 直连)"
-    local outs=(direct block ipv4-out ipv6-out)
-    local i=4
+    local outs=(direct block ipv4-out ipv6-out) i=4 tag proto c
     while IFS=$'\t' read -r tag proto; do
         i=$((i+1))
         printf "  %d. %-22s (%s)\n" "$i" "$tag" "$proto"
         outs+=("$tag")
     done < <(jq -r '.[] | [.tag, .protocol] | @tsv' "$SB_OUTBOUNDS")
     hr
-    local c
     read -rp "$(echo -e "${CYAN}请选择 [1-${i}]: ${NC}")" c
-    if ! [[ "$c" =~ ^[0-9]+$ ]] || (( c < 1 || c > i )); then
-        err "无效"; pause; return
-    fi
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= i )) || { err "无效"; pause; return; }
     local out_tag="${outs[$((c-1))]}"
 
-    local tmp; tmp=$(mktemp)
-    jq --argjson gs "$geosite_arr" --argjson dm "$domain_arr" --arg out "$out_tag" \
-       '. += [{geosite:$gs, domain:$dm, outbound:$out}]' \
-       "$SB_RULES" > "$tmp" && mv "$tmp" "$SB_RULES"
-
-    rebuild_config
-    if restart_sb; then
-        local desc=""
-        if [[ "$(echo "$geosite_arr" | jq 'length')" -gt 0 ]]; then
-            desc+="geosite:$(echo "$geosite_arr" | jq -r 'join(",geosite:")')"
-        fi
-        if [[ "$(echo "$domain_arr" | jq 'length')" -gt 0 ]]; then
-            [[ -n "$desc" ]] && desc+=","
-            desc+="$(echo "$domain_arr" | jq -r 'join(",")')"
-        fi
-        ok "已添加规则: [${desc}] -> [${out_tag}]"
-    else
-        tmp=$(mktemp)
-        jq 'del(.[-1])' "$SB_RULES" > "$tmp" && mv "$tmp" "$SB_RULES"
-        rebuild_config; restart_sb
-    fi
+    sb_commit "$SB_RULES" --argjson m "$match" --arg out "$out_tag" '. += [$m + {outbound:$out}]' \
+        && ok "已添加规则: [$(rule_desc "$match")] -> [${out_tag}]"
     pause
 }
 
-# ---------- 屏蔽/恢复 大陆 ----------
-toggle_block_cn() {
-    clear; show_banner
-    sec "屏蔽 / 恢复 大陆"
-    local cur; cur=$(jq -r '.block_cn' "$SB_SETTINGS")
-    if [[ "$cur" == "true" ]]; then
-        echo -e "当前状态: ${RED}已屏蔽${NC}"
-        echo "  1) 恢复大陆流量"
-    else
-        echo -e "当前状态: ${GREEN}未屏蔽${NC}"
-        echo "  1) 屏蔽大陆流量"
-    fi
-    echo "  0) 返回"
-    hr
-    local c
-    read -rp "$(echo -e "${CYAN}请选择 [0-1]: ${NC}")" c
-    [[ "$c" != "1" ]] && return
-    local new_val
-    [[ "$cur" == "true" ]] && new_val=false || new_val=true
-    local tmp; tmp=$(mktemp)
-    cp -f "$SB_SETTINGS" "${SB_SETTINGS}.bak"
-    jq --argjson v "$new_val" '.block_cn = $v' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
-    rebuild_config
-    if ! restart_sb; then
-        mv -f "${SB_SETTINGS}.bak" "$SB_SETTINGS"
-        rebuild_config && restart_sb >/dev/null
-        err "已撤销设置更改"; pause; return
-    fi
-    [[ "$new_val" == "true" ]] && ok "已屏蔽大陆" || ok "已恢复大陆"
-    pause
+# 修改 settings.json 的一个字段并生效（失败自动撤销）：settings_set <键> <JSON 值>
+settings_set() {
+    sb_commit "$SB_SETTINGS" --arg k "$1" --argjson v "$2" '.[$k] = $v'
 }
 
-# ---------- 阻断 / 放行 QUIC (HTTP/3) ----------
-toggle_block_quic() {
+# 开关类设置的通用界面：toggle_setting <键> <名称> [说明行...]
+toggle_setting() {
+    local key="$1" label="$2" cur new act line c
+    shift 2
     clear; show_banner
-    sec "阻断 / 放行 QUIC (HTTP/3)"
-    local cur; cur=$(jq -r '.block_quic // false' "$SB_SETTINGS")
+    sec "$label"
+    cur=$(jq -r --arg k "$key" '.[$k] // false' "$SB_SETTINGS")
     if [[ "$cur" == "true" ]]; then
-        echo -e "当前状态: ${GREEN}已阻断 QUIC${NC}"
-        echo "  1) 放行 QUIC"
+        echo -e "  当前: ${GREEN}已开启${NC}"; new=false; act="关闭"
     else
-        echo -e "当前状态: ${RED}未阻断${NC}"
-        echo "  1) 阻断 QUIC"
+        echo -e "  当前: ${RED}未开启${NC}"; new=true; act="开启"
     fi
-    echo
-    echo -e "${YELLOW}说明:${NC} Claude / ChatGPT 等 App 会优先用 HTTP/3 (QUIC, UDP)，"
-    echo "      线路 UDP 质量差时表现为「页面能开、回答一直转圈」。"
-    echo "      阻断后会自动回落 HTTP/2 (TCP)，通常能解决卡顿。"
-    echo
+    for line in "$@"; do echo -e "  ${YELLOW}${line}${NC}"; done
+    hr
+    echo "  1) ${act}「${label}」"
     echo "  0) 返回"
     hr
-    local c
     read -rp "$(echo -e "${CYAN}请选择 [0-1]: ${NC}")" c
-    [[ "$c" != "1" ]] && return
-    local new_val
-    [[ "$cur" == "true" ]] && new_val=false || new_val=true
-    local tmp; tmp=$(mktemp)
-    cp -f "$SB_SETTINGS" "${SB_SETTINGS}.bak"
-    jq --argjson v "$new_val" '.block_quic = $v' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
-    rebuild_config
-    if ! restart_sb; then
-        mv -f "${SB_SETTINGS}.bak" "$SB_SETTINGS"
-        rebuild_config && restart_sb >/dev/null
-        err "已撤销设置更改"; pause; return
-    fi
-    [[ "$new_val" == "true" ]] && ok "已阻断 QUIC (HTTP/3)" || ok "已放行 QUIC"
+    [[ "$c" == "1" ]] || return
+    settings_set "$key" "$new" && ok "「${label}」已${act}"
     pause
 }
 
@@ -1969,36 +1842,33 @@ view_del_rules() {
 }
 
 del_rule_by_index() {
-    local rn; rn=$(jq 'length' "$SB_RULES")
-    if (( rn == 0 )); then warn "无规则"; sleep 1; return; fi
+    local rn c
+    rn=$(jq 'length' "$SB_RULES")
+    (( rn == 0 )) && { warn "无规则"; sleep 1; return; }
     read -rp "$(echo -e "${CYAN}输入要删除的规则序号 [1-${rn}]: ${NC}")" c
-    if ! [[ "$c" =~ ^[0-9]+$ ]] || (( c < 1 || c > rn )); then
-        err "无效"; sleep 1; return
-    fi
-    local idx=$((c-1))
-    local tmp; tmp=$(mktemp)
-    jq "del(.[${idx}])" "$SB_RULES" > "$tmp" && mv "$tmp" "$SB_RULES"
-    rebuild_config; restart_sb && ok "规则已删除"; sleep 1
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= rn )) || { err "无效"; sleep 1; return; }
+    sb_commit "$SB_RULES" --argjson i "$((c-1))" 'del(.[$i])' && ok "规则已删除"
+    sleep 1
 }
 
 del_outbound_by_index() {
-    local on; on=$(jq 'length' "$SB_OUTBOUNDS")
-    if (( on == 0 )); then warn "无自定义出口"; sleep 1; return; fi
+    local on c idx tag y
+    on=$(jq 'length' "$SB_OUTBOUNDS")
+    (( on == 0 )) && { warn "无自定义出口"; sleep 1; return; }
     read -rp "$(echo -e "${CYAN}输入要删除的出口序号 (例如 N5): ${NC}")" c
-    c="${c#N}"; c="${c#n}"
-    if ! [[ "$c" =~ ^[0-9]+$ ]]; then err "无效"; sleep 1; return; fi
-    local idx=$((c - 5))
-    if (( idx < 0 || idx >= on )); then err "无效序号"; sleep 1; return; fi
-    local tag; tag=$(jq -r ".[${idx}].tag" "$SB_OUTBOUNDS")
+    c="${c#[Nn]}"
+    [[ "$c" =~ ^[0-9]+$ ]] || { err "无效"; sleep 1; return; }
+    idx=$((c - 5))      # N1-N4 是内置出口
+    (( idx >= 0 && idx < on )) || { err "无效序号"; sleep 1; return; }
+    tag=$(jq -r ".[${idx}].tag" "$SB_OUTBOUNDS")
     if jq -e --arg t "$tag" '.[] | select(.outbound == $t)' "$SB_RULES" >/dev/null; then
         err "出口 ${tag} 被分流规则引用，请先删除相关规则"
         sleep 2; return
     fi
     read -rp "$(echo -e "${YELLOW}确定删除出口 ${tag}? [y/N]: ${NC}")" y
     [[ "$y" =~ ^[Yy]$ ]] || return
-    local tmp; tmp=$(mktemp)
-    jq "del(.[${idx}])" "$SB_OUTBOUNDS" > "$tmp" && mv "$tmp" "$SB_OUTBOUNDS"
-    rebuild_config; restart_sb && ok "出口已删除"; sleep 1
+    sb_commit "$SB_OUTBOUNDS" --argjson i "$idx" 'del(.[$i])' && ok "出口已删除"
+    sleep 1
 }
 
 menu_routing() {
@@ -2022,7 +1892,7 @@ menu_routing() {
         case "$c" in
             1) add_outbound ;;
             2) add_rule ;;
-            3) toggle_block_cn ;;
+            3) toggle_setting block_cn "屏蔽大陆流量" "用户规则优先：被用户规则命中的流量不会被屏蔽" ;;
             4) view_del_rules ;;
             0|"") return ;;
             *) err "无效选择"; sleep 1 ;;
@@ -2116,39 +1986,22 @@ client_meta_init() {
 # ---- 把单个出口元信息(含proto+参数)转成 sing-box outbound JSON ----
 # 入参: 一段 JSON(含 tag, proto, 及各协议字段)。输出: sing-box outbound 对象。
 client_ob_to_singbox() {
-    local ob="$1"
-    local proto tag
-    proto=$(echo "$ob" | jq -r '.proto')
-    tag=$(echo "$ob" | jq -r '.tag')
-    case "$proto" in
-        vless-reality)
-            echo "$ob" | jq '{
-                type:"vless", tag:.tag, server:.server, server_port:.port, uuid:.uuid,
-                tls:{enabled:true, server_name:.sni,
-                     utls:{enabled:true, fingerprint:(.fp // "chrome")},
-                     reality:{enabled:true, public_key:.pbk, short_id:.sid}}
-            } | if ((.flow|not) or (.flow=="")) then . else . end' \
-            | jq --argjson src "$ob" 'if (($src.flow // "")|length)>0 then .flow=$src.flow else . end'
-            ;;
-        ss|ss2022)
-            echo "$ob" | jq '{
-                type:"shadowsocks", tag:.tag, server:.server, server_port:.port,
-                method:.method, password:.password
-            }'
-            ;;
-        anytls)
-            echo "$ob" | jq '{
-                type:"anytls", tag:.tag, server:.server, server_port:.port,
-                password:.password,
-                tls:{enabled:true, server_name:.sni, insecure:(.insecure // false)}
-            }'
-            ;;
-        *)
-            err "未知协议: $proto" >&2; return 1 ;;
-    esac
+    jq -e '
+        if .proto == "vless-reality" then
+            {type:"vless", tag, server, server_port:.port, uuid,
+             tls:{enabled:true, server_name:.sni,
+                  utls:{enabled:true, fingerprint:(.fp // "chrome")},
+                  reality:{enabled:true, public_key:.pbk, short_id:.sid}}}
+            + (if (.flow // "") != "" then {flow} else {} end)
+        elif .proto == "ss" or .proto == "ss2022" then
+            {type:"shadowsocks", tag, server, server_port:.port, method, password}
+        elif .proto == "anytls" then
+            {type:"anytls", tag, server, server_port:.port, password,
+             tls:{enabled:true, server_name:.sni, insecure:(.insecure // false)}}
+        else empty end' <<<"$1" || { err "未知协议: $(jq -r '.proto' <<<"$1")" >&2; return 1; }
 }
 
-# ---- 由元信息生成 client.json ----
+# ---- 由元信息生成 client.json（先校验再替换，失败不影响正在运行的配置）----
 rebuild_client_config() {
     [[ -f "$SB_CLIENT_META" ]] || { err "无客户端配置元信息"; return 1; }
 
@@ -2157,182 +2010,139 @@ rebuild_client_config() {
     final=$(jq -r '.final' "$SB_CLIENT_META")
     dl_detour=$(jq -r '.download_detour // "direct"' "$SB_CLIENT_META")
 
-    # 1) 生成所有出口的 sing-box outbound
-    local proxy_obs="[]"
-    local n i
-    n=$(jq '.outbounds | length' "$SB_CLIENT_META")
-    for (( i=0; i<n; i++ )); do
-        local ob sb_ob
-        ob=$(jq -c ".outbounds[$i]" "$SB_CLIENT_META")
+    # 1) 所有出口 + 内置 direct/block
+    local all_obs="[]" ob sb_ob
+    while IFS= read -r ob; do
         sb_ob=$(client_ob_to_singbox "$ob") || return 1
-        proxy_obs=$(echo "$proxy_obs" | jq --argjson o "$sb_ob" '. + [$o]')
-    done
-    # 追加内置 direct/block
-    local all_obs
-    all_obs=$(echo "$proxy_obs" | jq '. + [{type:"direct",tag:"direct"},{type:"block",tag:"block"}]')
+        all_obs=$(jq --argjson o "$sb_ob" '. + [$o]' <<<"$all_obs")
+    done < <(jq -c '.outbounds[]' "$SB_CLIENT_META")
+    all_obs=$(jq '. + [{type:"direct",tag:"direct"},{type:"block",tag:"block"}]' <<<"$all_obs")
 
-    # 2) 收集用到的 geosite,生成 rule_set 定义(remote .srs)
-    local used_geosite
-    used_geosite=$(jq -r '[.rules[].geosite[]?] | unique | .[]' "$SB_CLIENT_META")
-    local rule_sets="[]"
-    if [[ -n "$used_geosite" ]]; then
-        local rs="[" first=1 name url
-        while IFS= read -r name; do
-            [[ -z "$name" ]] && continue
-            url="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-${name}.srs"
-            [[ $first -eq 0 ]] && rs+=","
-            rs+="{\"type\":\"remote\",\"tag\":\"geosite-${name}\",\"format\":\"binary\",\"url\":\"${url}\",\"download_detour\":\"${dl_detour}\"}"
-            first=0
-        done <<< "$used_geosite"
-        rs+="]"
-        rule_sets="$rs"
-    fi
+    # 2) 用到的 geosite → 远程规则集
+    local rule_sets
+    # shellcheck disable=SC2046
+    rule_sets=$(rule_sets_json "$dl_detour" $(jq -r '.rules[].geosite[]? | "geosite-\(.)"' "$SB_CLIENT_META"))
 
-    # 3) 生成 route.rules:每条规则 -> {domain_suffix?/rule_set?, outbound, action:route}
+    # 3) 每条规则 -> {rule_set?/domain_suffix?} + route/reject
     local route_rules
     route_rules=$(jq '[.rules[] |
         (if (.geosite|length)>0 then {rule_set:[(.geosite[] | "geosite-\(.)")]} else {} end) +
         (if (.domain|length)>0 then {domain_suffix:.domain} else {} end) +
         (if .outbound == "block" then {action:"reject"} else {outbound:.outbound, action:"route"} end)
-        | select((has("rule_set")) or (has("domain_suffix")))
+        | select(has("rule_set") or has("domain_suffix"))
     ]' "$SB_CLIENT_META")
 
-    # DNS(resolve 需要;这里给 local 即可)
-    local dns; dns=$(jq -n '{servers:[{type:"local", tag:"local"}]}')
-
+    local tmp; tmp=$(mktemp --suffix=.json)
     jq -n \
         --argjson sport "$sport" \
         --argjson obs "$all_obs" \
         --argjson rsets "$rule_sets" \
         --argjson rules "$route_rules" \
         --arg final "$final" \
-        --argjson dns "$dns" \
         --arg log "$SB_CLIENT_LOG" \
         '{
             log:{level:"warn", output:$log, timestamp:true},
-            dns:$dns,
+            dns:{servers:[{type:"local", tag:"local"}]},
             inbounds:[{type:"mixed", tag:"mixed-in", listen:"127.0.0.1", listen_port:$sport}],
             outbounds:$obs,
             route:{rule_set:$rsets, rules:([{action:"sniff"}] + $rules), final:$final, auto_detect_interface:true}
-        }' > "$SB_CLIENT_CONF"
+        }' > "$tmp" || { rm -f "$tmp"; err "生成客户端配置失败"; return 1; }
+    if ! "$SB_BIN" check -c "$tmp" 2>/tmp/sb_client_check.err; then
+        err "客户端配置校验失败:"
+        cat /tmp/sb_client_check.err
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$SB_CLIENT_CONF"
+    chmod 600 "$SB_CLIENT_CONF"
 }
 
 restart_client() {
     # 确保 systemd 服务单元存在（首次添加出口时可能尚未创建）
     [[ -f "$SB_CLIENT_SERVICE" ]] || setup_client_service
-    if ! "$SB_BIN" check -c "$SB_CLIENT_CONF" 2>/tmp/sb_client_check.err; then
-        err "客户端配置校验失败:"
-        cat /tmp/sb_client_check.err
-        return 1
-    fi
     systemctl enable sing-box-client >/dev/null 2>&1
     systemctl restart sing-box-client
     sleep 1
     if systemctl is-active --quiet sing-box-client; then
         ok "客户端代理已启动"
         return 0
-    else
-        err "客户端启动失败:"
-        journalctl -u sing-box-client -n 10 --no-pager | tail -n 10
-        return 1
     fi
+    err "客户端启动失败:"
+    journalctl -u sing-box-client -n 10 --no-pager | tail -n 10
+    return 1
+}
+
+# 修改客户端元信息 → 重建 → 重启；失败恢复原状（含服务原本的运行状态）
+# 用法：client_commit [jq 参数...] '<过滤器>'
+client_commit() {
+    local bak="${SB_CLIENT_META}.bak" was_active=0
+    systemctl is-active --quiet sing-box-client 2>/dev/null && was_active=1
+    cp -f "$SB_CLIENT_META" "$bak" || return 1
+    json_edit "$SB_CLIENT_META" "$@" || { rm -f "$bak"; return 1; }
+    if rebuild_client_config && restart_client; then
+        rm -f "$bak"
+        return 0
+    fi
+    err "重载失败，已撤销本次更改"
+    mv -f "$bak" "$SB_CLIENT_META"
+    rebuild_client_config
+    if (( was_active )); then
+        restart_client >/dev/null 2>&1
+    else
+        systemctl stop sing-box-client >/dev/null 2>&1
+    fi
+    return 1
 }
 
 # ---- 分协议录入(输出含 proto 的 node json，不含 tag) ----
-_ask_server_port() {
-    local _s _p
-    read -rp "$(echo -e "${CYAN}落地服务器地址 (IP 或域名): ${NC}")" _s
-    [[ -z "$_s" ]] && { err "地址不能为空" >&2; return 1; }
-    read -rp "$(echo -e "${CYAN}端口: ${NC}")" _p
-    [[ "$_p" =~ ^[0-9]+$ ]] && (( _p>=1 && _p<=65535 )) || { err "端口非法" >&2; return 1; }
-    echo "${_s}|${_p}"
-}
-
 client_node_vless() {
-    local node_json="" link=""
+    local node_json="" link="" src
     echo "  录入方式:" >&2
     echo "    1) 粘贴 vless:// 链接" >&2
     echo "    2) 手动逐项填写" >&2
     echo "    0) 返回" >&2
-    local src; read -rp "$(echo -e "${CYAN}请选择: ${NC}")" src
+    read -rp "$(echo -e "${CYAN}请选择: ${NC}")" src
     case "$src" in
         1)
             read -rp "$(echo -e "${CYAN}粘贴 vless:// 链接: ${NC}")" link
-            [[ "$link" == vless://* ]] || { err "不是有效的 vless 链接" >&2; return 1; }
             node_json=$(parse_vless_link "$link")
             ;;
         2)
-            local sp server port uuid sni pbk sid flow fp
-            sp=$(_ask_server_port) || return 1
-            server="${sp%|*}"; port="${sp#*|}"
+            local sp uuid sni pbk sid flow fp
+            sp=$(ask_server_port) || return 1
             read -rp "$(echo -e "${CYAN}UUID: ${NC}")" uuid
             read -rp "$(echo -e "${CYAN}SNI (server_name): ${NC}")" sni
             read -rp "$(echo -e "${CYAN}public_key (pbk): ${NC}")" pbk
             read -rp "$(echo -e "${CYAN}short_id (sid, 可空): ${NC}")" sid
             read -rp "$(echo -e "${CYAN}flow (一般 xtls-rprx-vision, 可空): ${NC}")" flow
-            read -rp "$(echo -e "${CYAN}指纹 fp [默认 chrome]: ${NC}")" fp; fp="${fp:-chrome}"
-            node_json=$(jq -n --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
-                --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg fp "$fp" \
+            read -rp "$(echo -e "${CYAN}指纹 fp [默认 chrome]: ${NC}")" fp
+            node_json=$(jq -n --arg server "${sp%|*}" --argjson port "${sp#*|}" --arg uuid "$uuid" \
+                --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg fp "${fp:-chrome}" \
                 '{server:$server, port:$port, uuid:$uuid, sni:$sni, pbk:$pbk, sid:$sid, flow:$flow, fp:$fp}')
             ;;
-        0|"") return 1 ;;
-        *) err "无效选择" >&2; return 1 ;;
+        *) return 1 ;;
     esac
-    [[ -z "$node_json" ]] && { err "解析失败" >&2; return 1; }
-    local pbk; pbk=$(echo "$node_json" | jq -r '.pbk // empty')
-    [[ -z "$pbk" || "$pbk" == "null" ]] && { err "缺少 public_key(pbk)" >&2; return 1; }
-    echo "$node_json" | jq '. + {proto:"vless-reality"}'
+    [[ -n "$node_json" ]] || { err "不是有效的 vless 链接" >&2; return 1; }
+    jq -e '(.pbk // "") != ""' <<<"$node_json" >/dev/null || { err "缺少 public_key(pbk)" >&2; return 1; }
+    jq '. + {proto:"vless-reality"}' <<<"$node_json"
 }
 
 client_node_ss() {
-    local is2022="$1"
-    local sp server port method pwd
-    sp=$(_ask_server_port) || return 1
-    server="${sp%|*}"; port="${sp#*|}"
-    echo "  加密方式:" >&2
-    if [[ "$is2022" == "1" ]]; then
-        echo "    1) 2022-blake3-aes-128-gcm" >&2
-        echo "    2) 2022-blake3-aes-256-gcm" >&2
-        echo "    3) 2022-blake3-chacha20-poly1305" >&2
-        local m; read -rp "$(echo -e "${CYAN}选择 [1-3]: ${NC}")" m
-        case "$m" in
-            1) method="2022-blake3-aes-128-gcm" ;;
-            2) method="2022-blake3-aes-256-gcm" ;;
-            3) method="2022-blake3-chacha20-poly1305" ;;
-            *) err "无效" >&2; return 1 ;;
-        esac
-    else
-        echo "    1) aes-128-gcm" >&2
-        echo "    2) aes-256-gcm" >&2
-        echo "    3) chacha20-ietf-poly1305" >&2
-        echo "    4) xchacha20-ietf-poly1305" >&2
-        local m; read -rp "$(echo -e "${CYAN}选择 [1-4]: ${NC}")" m
-        case "$m" in
-            1) method="aes-128-gcm" ;;
-            2) method="aes-256-gcm" ;;
-            3) method="chacha20-ietf-poly1305" ;;
-            4) method="xchacha20-ietf-poly1305" ;;
-            *) err "无效" >&2; return 1 ;;
-        esac
-    fi
-    read -rp "$(echo -e "${CYAN}密码 (password / SS2022 base64 密钥): ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空" >&2; return 1; }
-    local proto; [[ "$is2022" == "1" ]] && proto="ss2022" || proto="ss"
-    jq -n --arg server "$server" --argjson port "$port" \
-        --arg method "$method" --arg password "$pwd" --arg proto "$proto" \
+    local is2022="$1" sp method pwd
+    sp=$(ask_server_port) || return 1
+    method=$(pick_ss_method "$([[ "$is2022" == "1" ]] && echo 2022 || echo legacy)") || return 1
+    pwd=$(ask_required "密码 (password / SS2022 base64 密钥)") || return 1
+    jq -n --arg server "${sp%|*}" --argjson port "${sp#*|}" --arg method "$method" --arg password "$pwd" \
+        --arg proto "$([[ "$is2022" == "1" ]] && echo ss2022 || echo ss)" \
         '{proto:$proto, server:$server, port:$port, method:$method, password:$password}'
 }
 
 client_node_anytls() {
-    local sp server port pwd sni insec
-    sp=$(_ask_server_port) || return 1
-    server="${sp%|*}"; port="${sp#*|}"
-    read -rp "$(echo -e "${CYAN}密码 (password): ${NC}")" pwd
-    [[ -z "$pwd" ]] && { err "密码不能为空" >&2; return 1; }
+    local sp pwd sni insec
+    sp=$(ask_server_port) && pwd=$(ask_required "密码 (password)") || return 1
     read -rp "$(echo -e "${CYAN}SNI (server_name): ${NC}")" sni
-    read -rp "$(echo -e "${CYAN}跳过证书验证? (自签填 y) [y/N]: ${NC}")" insec
-    [[ "$insec" =~ ^[Yy]$ ]] && insec="true" || insec="false"
-    jq -n --arg server "$server" --argjson port "$port" \
+    insec=$(ask_insecure)
+    jq -n --arg server "${sp%|*}" --argjson port "${sp#*|}" \
         --arg password "$pwd" --arg sni "$sni" --argjson insecure "$insec" \
         '{proto:"anytls", server:$server, port:$port, password:$password, sni:$sni, insecure:$insecure}'
 }
@@ -2348,7 +2158,7 @@ client_outbound_add() {
     echo "    4) AnyTLS"
     echo "    0) 返回"
     hr
-    local pc node=""
+    local pc node="" tag
     read -rp "$(echo -e "${CYAN}请选择 [0-4]: ${NC}")" pc
     echo
     case "$pc" in
@@ -2361,37 +2171,18 @@ client_outbound_add() {
     esac
     [[ -z "$node" ]] && { pause; return; }
 
-    # 取 tag(唯一)
-    local tag
     while :; do
         read -rp "$(echo -e "${CYAN}给这个出口起个名字(tag,如 out-cc): ${NC}")" tag
         tag="${tag// /}"
         [[ -z "$tag" ]] && { err "不能为空"; continue; }
         [[ "$tag" == "direct" || "$tag" == "block" ]] && { err "tag 不能用保留字 direct/block"; continue; }
-        if jq -e --arg t "$tag" '.outbounds[]|select(.tag==$t)' "$SB_CLIENT_META" >/dev/null 2>&1; then
-            err "tag 已存在"; continue
-        fi
+        jq -e --arg t "$tag" '.outbounds[] | select(.tag == $t)' "$SB_CLIENT_META" >/dev/null 2>&1 \
+            && { err "tag 已存在"; continue; }
         break
     done
 
-    local tmp; tmp=$(mktemp)
-    local was_active=0
-    systemctl is-active --quiet sing-box-client 2>/dev/null && was_active=1
-    cp -f "$SB_CLIENT_META" "${SB_CLIENT_META}.bak"
-    jq --argjson node "$node" --arg tag "$tag" \
-        '.outbounds += [($node + {tag:$tag})]' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-    if rebuild_client_config && restart_client; then
-        ok "出口 ${tag} 已添加"
-    else
-        err "重载失败(请检查参数)，已撤销本次添加"
-        mv -f "${SB_CLIENT_META}.bak" "$SB_CLIENT_META"
-        rebuild_client_config
-        if (( was_active )); then
-            restart_client >/dev/null 2>&1
-        else
-            systemctl stop sing-box-client >/dev/null 2>&1
-        fi
-    fi
+    client_commit --argjson node "$node" --arg tag "$tag" '.outbounds += [($node + {tag:$tag})]' \
+        && ok "出口 ${tag} 已添加"
     pause
 }
 
@@ -2425,9 +2216,7 @@ client_outbound_del() {
     if [[ "$(jq -r '.download_detour // "direct"' "$SB_CLIENT_META")" == "$tag" ]]; then
         warn "出口 ${tag} 是 geosite 下载出口，请先在客户端设置里改掉"; pause; return
     fi
-    local tmp; tmp=$(mktemp)
-    jq "del(.outbounds[$((idx-1))])" "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-    rebuild_client_config && restart_client && ok "已删除 ${tag}" || err "重载失败"
+    client_commit --argjson i "$((idx-1))" 'del(.outbounds[$i])' && ok "已删除 ${tag}"
     pause
 }
 
@@ -2471,54 +2260,42 @@ client_rule_list_inline() {
 client_rule_add() {
     clear; show_banner
     sec "分流规则 → 添加规则"
-    local on; on=$(jq '.outbounds|length' "$SB_CLIENT_META")
+    local on input match t pick i=0
+    on=$(jq '.outbounds|length' "$SB_CLIENT_META")
     (( on==0 )) && { warn "请先在「出口管理」添加至少一个出口"; pause; return; }
 
     read -rp "$(echo -e "${CYAN}目标域名(多个逗号分隔,支持 geosite:xxx): ${NC}")" input
     [[ -z "$input" ]] && return
-    local geo="[]" dom="[]"
-    local IFS=',' item
-    for item in $input; do
-        item="${item// /}"; [[ -z "$item" ]] && continue
-        if [[ "$item" == geosite:* ]]; then
-            geo=$(echo "$geo" | jq --arg n "${item#geosite:}" '. + [$n]')
-        else
-            dom=$(echo "$dom" | jq --arg n "$item" '. + [$n]')
-        fi
-    done
-    unset IFS
-    [[ "$(echo "$geo" | jq 'length')" == "0" && "$(echo "$dom" | jq 'length')" == "0" ]] && { err "无有效规则"; pause; return; }
+    match=$(parse_rule_input "$input")
+    jq -e '(.geosite + .domain) | length > 0' <<<"$match" >/dev/null || { err "无有效规则"; pause; return; }
 
     echo
     echo -e "  ${CYAN}这些流量走哪个出口?${NC}"
-    local tags=() i=0
+    local tags=()
     while IFS= read -r t; do
         i=$((i+1)); echo "    $i) $t"; tags+=("$t")
     done < <(jq -r '.outbounds[].tag' "$SB_CLIENT_META")
     hr
-    local pick; read -rp "$(echo -e "${CYAN}选择出口编号: ${NC}")" pick
+    read -rp "$(echo -e "${CYAN}选择出口编号: ${NC}")" pick
     [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=i )) || { err "无效"; pause; return; }
     local out="${tags[$((pick-1))]}"
 
-    local tmp; tmp=$(mktemp)
-    jq --argjson geo "$geo" --argjson dom "$dom" --arg out "$out" \
-        '.rules += [{domain:$dom, geosite:$geo, outbound:$out}]' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-    rebuild_client_config && restart_client && ok "规则已添加 -> ${out}" || err "重载失败"
+    client_commit --argjson m "$match" --arg out "$out" '.rules += [$m + {outbound:$out}]' \
+        && ok "规则已添加 -> ${out}"
     pause
 }
 
 client_rule_del() {
     clear; show_banner
     sec "分流规则 → 删除规则"
-    local n; n=$(jq '.rules|length' "$SB_CLIENT_META")
+    local n idx
+    n=$(jq '.rules|length' "$SB_CLIENT_META")
     (( n==0 )) && { warn "没有规则"; pause; return; }
     client_rule_list_inline
     hr
-    local idx; read -rp "$(echo -e "${CYAN}输入要删除的编号: ${NC}")" idx
+    read -rp "$(echo -e "${CYAN}输入要删除的编号: ${NC}")" idx
     [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=n )) || { err "无效编号"; pause; return; }
-    local tmp; tmp=$(mktemp)
-    jq "del(.rules[$((idx-1))])" "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-    rebuild_client_config && restart_client && ok "已删除规则" || err "重载失败"
+    client_commit --argjson i "$((idx-1))" 'del(.rules[$i])' && ok "已删除规则"
     pause
 }
 
@@ -2569,9 +2346,7 @@ menu_client_settings() {
                 local p; read -rp "$(echo -e "${CYAN}新端口 [1024-65535]: ${NC}")" p
                 [[ "$p" =~ ^[0-9]+$ ]] && (( p>=1024 && p<=65535 )) || { err "非法"; sleep 1; continue; }
                 if [[ "$p" != "$sport" ]] && port_in_use "$p"; then err "端口 ${p} 已被占用"; sleep 1; continue; fi
-                local tmp; tmp=$(mktemp)
-                jq --argjson p "$p" '.socks_port=$p' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-                rebuild_client_config && restart_client && ok "端口已改为 ${p}" || err "失败"
+                client_commit --argjson p "$p" '.socks_port = $p' && ok "端口已改为 ${p}"
                 pause ;;
             2|3)
                 local field label
@@ -2591,9 +2366,7 @@ menu_client_settings() {
                 else
                     err "无效"; sleep 1; continue
                 fi
-                local tmp; tmp=$(mktemp)
-                jq --arg f "$field" --arg v "$val" '.[$f]=$v' "$SB_CLIENT_META" > "$tmp" && mv "$tmp" "$SB_CLIENT_META"
-                rebuild_client_config && restart_client && ok "${label} 已设为 ${val}" || err "失败"
+                client_commit --arg f "$field" --arg v "$val" '.[$f] = $v' && ok "${label} 已设为 ${val}"
                 pause ;;
             0|"") return ;;
             *) err "无效"; sleep 1 ;;
@@ -3055,18 +2828,7 @@ ddns_count() { jq '(.records // []) | length' "$CF_DDNS_CONF" 2>/dev/null || ech
 ddns_token() { jq -r '.api_token // empty' "$CF_DDNS_CONF"; }
 
 # 原子改写配置：ddns_edit [jq 选项...] '过滤器'
-ddns_edit() {
-    local tmp
-    tmp=$(mktemp "${CF_DDNS_CONF}.XXXXXX") || { err "无法写入 DDNS 配置"; return 1; }
-    if jq "$@" "$CF_DDNS_CONF" > "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
-        chmod 600 "$tmp"
-        mv -f "$tmp" "$CF_DDNS_CONF"
-    else
-        rm -f "$tmp"
-        err "更新 DDNS 配置失败"
-        return 1
-    fi
-}
+ddns_edit() { json_edit "$CF_DDNS_CONF" "$@"; }
 
 # 是否已存在 (域名, 类型) 这条记录
 ddns_has() {
@@ -3719,18 +3481,7 @@ ipc_bootstrap() {
 
 ipc_configured() { [[ -n "$(jq -r '.change_url // empty' "$IPC_CONF" 2>/dev/null)" ]]; }
 
-ipc_edit() {
-    local tmp
-    tmp=$(mktemp "${IPC_CONF}.XXXXXX") || { err "无法写入换 IP 配置"; return 1; }
-    if jq "$@" "$IPC_CONF" > "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
-        chmod 600 "$tmp"
-        mv -f "$tmp" "$IPC_CONF"
-    else
-        rm -f "$tmp"
-        err "更新换 IP 配置失败"
-        return 1
-    fi
-}
+ipc_edit() { json_edit "$IPC_CONF" "$@"; }
 
 # 界面上隐藏 token：https://api.x.com/ipch/abcdefghij → https://api.x.com/ipch/abc****hij
 ipc_mask() {
@@ -4002,22 +3753,21 @@ menu_ip_strategy() {
             2) new="prefer_ipv6" ;;
             3) new="ipv4_only" ;;
             4) new="ipv6_only" ;;
-            5) toggle_block_quic; continue ;;
+            5) toggle_setting block_quic "阻断 QUIC (HTTP/3)" \
+                   "Claude / ChatGPT 等 App 会优先用 HTTP/3 (QUIC, UDP)，" \
+                   "线路 UDP 质量差时表现为「页面能开、回答一直转圈」。" \
+                   "阻断后会自动回落 HTTP/2 (TCP)，通常能解决卡顿。"
+               continue ;;
             0|"") return ;;
             *) err "无效"; sleep 1; continue ;;
         esac
-        local tmp; tmp=$(mktemp)
-        cp -f "$SB_SETTINGS" "${SB_SETTINGS}.bak"
-        jq --arg s "$new" '.ip_strategy = $s' "$SB_SETTINGS" > "$tmp" && mv "$tmp" "$SB_SETTINGS"
-        rebuild_config
-        if restart_sb; then
+        if settings_set ip_strategy "\"${new}\""; then
+            snell_sync_all      # snell-server 节点的出口策略也跟随
             ok "已切换为 ${new}"
+            sleep 1
         else
-            mv -f "${SB_SETTINGS}.bak" "$SB_SETTINGS"
-            rebuild_config && restart_sb >/dev/null
-            err "已撤销设置更改"; pause
+            pause
         fi
-        sleep 1
     done
 }
 
@@ -4160,7 +3910,7 @@ update_script() {
     msg "从 ${SCRIPT_UPDATE_URL} 下载新版..."
     local tmp; tmp=$(mktemp)
     if curl -fsSL "$SCRIPT_UPDATE_URL" -o "$tmp"; then
-        if head -n 1 "$tmp" | grep -q '^#!/.*bash'; then
+        if head -n 1 "$tmp" | grep -q '^#!/.*bash' && bash -n "$tmp" 2>/dev/null; then
             install -m 755 "$tmp" "$SB_SCRIPT_PATH"
             rm -f "$tmp"
             ok "脚本已更新，请重新执行 sb"
@@ -4178,7 +3928,7 @@ update_script() {
 do_uninstall() {
     clear; show_banner
     sec "${RED}一键卸载${NC}"
-    echo "将删除: sing-box、配置、systemd 服务、日志、sb 命令"
+    echo "将删除: sing-box、官方 snell-server、配置、systemd 服务、日志、sb 命令"
     echo
     read -rp "$(echo -e "${YELLOW}确定卸载? 输入 ${BOLD}YES${NC}${YELLOW} 确认: ${NC}")" y
     [[ "$y" == "YES" ]] || { warn "已取消"; pause; return; }
@@ -4200,6 +3950,7 @@ do_uninstall() {
             warn "已保留换 IP 服务和配置"
         fi
     fi
+    snell_uninstall_all
     systemctl stop sing-box 2>/dev/null
     systemctl disable sing-box 2>/dev/null
     rm -f "$SB_SERVICE"
@@ -4230,21 +3981,7 @@ show_banner() {
         active="${RED}stopped${NC}"
     fi
     node_count=$(jq 'length' "$SB_NODES" 2>/dev/null || echo 0)
-    # 标题分割线（绿色版的 sec，居中自适应）
-    local title="Sing-box Script v${SCRIPT_VERSION} By ${SCRIPT_AUTHOR}"
-    local w side_eq bytes chars non_ascii_chars ascii_chars visual
-    w=$(term_width)
-    bytes=$(printf '%s' " ${title} " | wc -c)
-    chars=$(printf '%s' " ${title} " | wc -m)
-    non_ascii_chars=$(( (bytes - chars) / 2 ))
-    ascii_chars=$(( chars - non_ascii_chars ))
-    visual=$(( ascii_chars + non_ascii_chars * 2 ))
-    side_eq=$(( (w - visual) / 2 ))
-    (( side_eq < 3 )) && side_eq=3
-    local left right
-    left=$(printf "%${side_eq}s" '' | tr ' ' '=')
-    right=$(printf "%${side_eq}s" '' | tr ' ' '=')
-    echo -e "${GREEN}${left} ${BOLD}${title}${NC}${GREEN} ${right}${NC}"
+    center_line "$GREEN" "Sing-box Script v${SCRIPT_VERSION} By ${SCRIPT_AUTHOR}"
     echo
     echo -e "  sing-box: ${sb_ver:-未安装}"
     echo
@@ -4307,21 +4044,8 @@ main_menu() {
 
 first_install() {
     clear
-    # 复用 show_banner 的标题逻辑（但此时 sing-box 尚未安装，banner 不能直接调用）
-    local title="Sing-box Script v${SCRIPT_VERSION} By ${SCRIPT_AUTHOR}"
-    local w side_eq bytes chars non_ascii_chars ascii_chars visual
-    w=$(term_width)
-    bytes=$(printf '%s' " ${title} " | wc -c)
-    chars=$(printf '%s' " ${title} " | wc -m)
-    non_ascii_chars=$(( (bytes - chars) / 2 ))
-    ascii_chars=$(( chars - non_ascii_chars ))
-    visual=$(( ascii_chars + non_ascii_chars * 2 ))
-    side_eq=$(( (w - visual) / 2 ))
-    (( side_eq < 3 )) && side_eq=3
-    local left right
-    left=$(printf "%${side_eq}s" '' | tr ' ' '=')
-    right=$(printf "%${side_eq}s" '' | tr ' ' '=')
-    echo -e "${GREEN}${left} ${BOLD}${title}${NC}${GREEN} ${right}${NC}"
+    # sing-box 尚未安装，show_banner 不能用，只画标题
+    center_line "$GREEN" "Sing-box Script v${SCRIPT_VERSION} By ${SCRIPT_AUTHOR}"
     echo
     sec "首次运行：开始安装"
     check_debian
