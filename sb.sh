@@ -2987,15 +2987,22 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 EOF
-    ddns_put "$CF_DDNS_TIMER" 644 <<'EOF' && rc=0
+    local min jitter acc
+    min=$(ddns_interval)
+    case "$min" in
+        1) jitter=5s;  acc=5s  ;;
+        2) jitter=10s; acc=5s  ;;
+        *) jitter=20s; acc=10s ;;
+    esac
+    ddns_put "$CF_DDNS_TIMER" 644 <<EOF && rc=0
 [Unit]
-Description=Run Cloudflare DDNS updater every 5 minutes
+Description=Run Cloudflare DDNS updater every ${min} minute(s)
 
 [Timer]
 OnBootSec=30s
-OnUnitActiveSec=5min
-RandomizedDelaySec=20s
-AccuracySec=10s
+OnUnitActiveSec=${min}min
+RandomizedDelaySec=${jitter}
+AccuracySec=${acc}
 
 [Install]
 WantedBy=timers.target
@@ -3034,6 +3041,13 @@ ddns_remove() {
 
 ddns_count() { jq '(.records // []) | length' "$CF_DDNS_CONF" 2>/dev/null || echo 0; }
 ddns_token() { jq -r '.api_token // empty' "$CF_DDNS_CONF"; }
+
+# 同步间隔（分钟）：只允许 1 / 2 / 5，缺省或非法值按 5
+ddns_interval() {
+    local m
+    m=$(jq -r '.interval_min // 5' "$CF_DDNS_CONF" 2>/dev/null)
+    case "$m" in 1|2|5) echo "$m" ;; *) echo 5 ;; esac
+}
 
 # 原子改写配置：ddns_edit [jq 选项...] '过滤器'
 ddns_edit() { json_edit "$CF_DDNS_CONF" "$@"; }
@@ -3369,6 +3383,35 @@ ddns_sync_now() {
     pause
 }
 
+ddns_set_interval() {
+    (( $(ddns_count) > 0 )) || { err "尚未配置 DDNS 记录"; pause; return; }
+    clear; show_banner
+    sec "同步间隔"
+    local cur m c
+    cur=$(ddns_interval)
+    echo -e "  当前: ${CYAN}每 ${cur} 分钟${NC}"
+    echo -e "  ${YELLOW}记录 TTL 为自动 (约 300 秒)，客户端最坏还要再等一个 TTL 才会拿到新 IP${NC}"
+    hr
+    echo "  1. 每 1 分钟"
+    echo "  2. 每 2 分钟"
+    echo "  3. 每 5 分钟 (默认)"
+    echo "  0. 返回"
+    hr
+    read -rp "$(echo -e "${CYAN}请选择 [0-3]: ${NC}")" c
+    case "$c" in
+        1) m=1 ;; 2) m=2 ;; 3) m=5 ;;
+        0|"") return ;;
+        *) err "无效选择"; sleep 1; return ;;
+    esac
+    if [[ "$m" == "$cur" ]]; then
+        ok "未变化"; sleep 1; return
+    fi
+    ddns_edit --argjson m "$m" '.interval_min = $m' || { pause; return; }
+    ddns_deploy
+    ok "已改为每 ${m} 分钟同步一次"
+    sleep 1
+}
+
 ddns_menu() {
     while :; do
         clear; show_banner
@@ -3376,7 +3419,7 @@ ddns_menu() {
         local n timer="${RED}未运行${NC}"
         n=$(ddns_count)
         systemctl is-active --quiet sb-cloudflare-ddns.timer 2>/dev/null \
-            && timer="${GREEN}运行中 (每 5 分钟)${NC}"
+            && timer="${GREEN}运行中 (每 $(ddns_interval) 分钟)${NC}"
         if (( n == 0 )); then
             echo -e "  ${YELLOW}尚未配置记录${NC}"
         else
@@ -3390,10 +3433,11 @@ ddns_menu() {
         echo "  4. 状态检查"
         echo "  5. 立即同步"
         echo "  6. 更换 API Token"
+        echo "  7. 同步间隔"
         echo "  0. 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-6]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" c
         case "$c" in
             1) ddns_add ;;
             2) ddns_edit_record ;;
@@ -3401,6 +3445,7 @@ ddns_menu() {
             4) ddns_status ;;
             5) ddns_sync_now ;;
             6) ddns_change_token ;;
+            7) ddns_set_interval ;;
             0|"") return ;;
             *) err "无效选择"; sleep 1 ;;
         esac
@@ -3496,7 +3541,7 @@ sync_ddns() {
     if "$DDNS_BIN" -v update 2>&1 | sed 's/^/    /'; then
         log "DDNS 已同步"
     else
-        log "DDNS 同步出错，5 分钟定时器会自动重试"
+        log "DDNS 同步出错，DDNS 定时器会自动重试"
     fi
 }
 
