@@ -2884,6 +2884,26 @@ sync_record() {   # sync_record TYPE HOST ZONE_ID PROXIED IP
     payload=$(jq -nc --arg c "$ip" --argjson p "$proxied" '{content:$c, proxied:$p}')
     cf PATCH "/zones/${zone}/dns_records/${id}" "$payload" >/dev/null || return 1
     log "~ ${host} (${type}) ${cur} -> ${ip}"
+    [[ "${cur,,}" != "${ip,,}" ]] && CHANGED[$type]="${cur} -> ${ip}"
+    return 0
+}
+
+# IP 变更时发 Telegram 通知（配置了 tg_bot_token / tg_chat_id 才发）
+declare -A CHANGED=()
+notify_ip_change() {
+    (( ${#CHANGED[@]} )) || return 0
+    local bot chat text t
+    bot=$(jq -r '.tg_bot_token // empty' "$CONF")
+    chat=$(jq -r '.tg_chat_id // empty' "$CONF")
+    [[ -n "$bot" && -n "$chat" ]] || return 0
+    text="IP 变更 [$(hostname)]"
+    for t in A AAAA; do
+        [[ -n "${CHANGED[$t]:-}" ]] && text+=$'\n'"${t}: ${CHANGED[$t]}"
+    done
+    curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null \
+        -K <(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$bot") \
+        --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" \
+        || warn "Telegram 通知发送失败"
 }
 
 cmd_update() {
@@ -2896,6 +2916,7 @@ cmd_update() {
     while IFS=$'\t' read -r type host zone proxied; do
         sync_record "$type" "$host" "$zone" "$proxied" "${IPS[$type]:-}" || status=1
     done < <(records)
+    notify_ip_change
     exit "$status"
 }
 
@@ -3412,6 +3433,42 @@ ddns_set_interval() {
     sleep 1
 }
 
+ddns_set_tg() {
+    (( $(ddns_count) > 0 )) || { err "尚未配置 DDNS 记录"; pause; return; }
+    clear; show_banner
+    sec "IP 变更通知 (Telegram)"
+    local bot chat c
+    chat=$(jq -r 'if (.tg_bot_token // "") != "" and (.tg_chat_id // "") != "" then .tg_chat_id else empty end' "$CF_DDNS_CONF")
+    if [[ -n "$chat" ]]; then
+        echo -e "  当前: ${GREEN}已开启${NC}  (Chat ID: ${chat})"
+    else
+        echo -e "  当前: ${YELLOW}未开启${NC}"
+    fi
+    hr
+    echo "  1. 设置 / 修改"
+    echo "  2. 清空 (关闭通知)"
+    echo "  0. 返回"
+    hr
+    read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" c
+    case "$c" in
+        1)
+            read -rsp "$(echo -e "${CYAN}Bot Token: ${NC}")" bot
+            echo
+            [[ "$bot" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { err "Bot Token 格式不正确，未改动"; pause; return; }
+            read -rp "$(echo -e "${CYAN}Chat ID (你的 TG user id): ${NC}")" chat
+            [[ "$chat" =~ ^-?[0-9]+$ ]] || { err "Chat ID 应为数字，未改动"; pause; return; }
+            ddns_edit --arg b "$bot" --arg c "$chat" '.tg_bot_token = $b | .tg_chat_id = $c' \
+                && ok "已开启：IP 变更时发送通知"
+            bot=""
+            ;;
+        2)
+            ddns_edit 'del(.tg_bot_token, .tg_chat_id)' && ok "已清空，IP 变更通知已关闭"
+            ;;
+        *) return ;;
+    esac
+    pause
+}
+
 ddns_menu() {
     while :; do
         clear; show_banner
@@ -3434,10 +3491,11 @@ ddns_menu() {
         echo "  5. 立即同步"
         echo "  6. 更换 API Token"
         echo "  7. 同步间隔"
+        echo "  8. IP 变更通知 (Telegram)"
         echo "  0. 返回上一页"
         hr
         local c
-        read -rp "$(echo -e "${CYAN}请选择 [0-7]: ${NC}")" c
+        read -rp "$(echo -e "${CYAN}请选择 [0-8]: ${NC}")" c
         case "$c" in
             1) ddns_add ;;
             2) ddns_edit_record ;;
@@ -3446,6 +3504,7 @@ ddns_menu() {
             5) ddns_sync_now ;;
             6) ddns_change_token ;;
             7) ddns_set_interval ;;
+            8) ddns_set_tg ;;
             0|"") return ;;
             *) err "无效选择"; sleep 1 ;;
         esac
