@@ -113,11 +113,15 @@ install_deps() {
     msg "安装依赖..."
     apt-get update -y >/dev/null 2>&1
     apt-get install -y curl wget jq tar openssl ca-certificates \
-        uuid-runtime iproute2 util-linux vnstat chrony >/dev/null 2>&1
+        uuid-runtime iproute2 util-linux vnstat >/dev/null 2>&1
     systemctl enable vnstat >/dev/null 2>&1 || true
     systemctl start vnstat >/dev/null 2>&1 || true
-    systemctl enable chrony >/dev/null 2>&1 || true
-    systemctl start chrony >/dev/null 2>&1 || true
+    # 容器（LXC/OpenVZ）没有改系统时间的权限，chrony 起不来，装了也没用
+    if ! is_container; then
+        apt-get install -y chrony >/dev/null 2>&1
+        systemctl enable chrony >/dev/null 2>&1 || true
+        systemctl start chrony >/dev/null 2>&1 || true
+    fi
     # apt 的输出被静音了，失败时要主动发现，否则后面所有 jq/curl 操作都会莫名失败
     local c missing=()
     for c in curl jq tar openssl uuidgen ss; do
@@ -130,32 +134,68 @@ install_deps() {
     ok "依赖安装完成"
 }
 
+# 是否运行在容器里（LXC / OpenVZ / Docker 等，与宿主机共用内核和时钟）
+is_container() {
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt -c -q 2>/dev/null && return 0
+    fi
+    [[ -f /proc/user_beancounters ]] && return 0          # OpenVZ
+    grep -qa 'container=' /proc/1/environ 2>/dev/null && return 0
+    return 1
+}
+
+# 用 HTTPS 响应头里的 Date 估算本机时间偏差（秒，取绝对值），失败输出空
+http_time_offset() {
+    local url hdr remote now
+    for url in https://www.cloudflare.com https://www.google.com https://www.apple.com; do
+        hdr=$(curl -sI --max-time 5 "$url" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="date"{print $2; exit}')
+        [[ -n "$hdr" ]] || continue
+        remote=$(date -d "$hdr" +%s 2>/dev/null) || continue
+        now=$(date +%s)
+        echo $(( now > remote ? now - remote : remote - now ))
+        return 0
+    done
+    return 1
+}
+
 # 检查时间是否同步（SS-2022/Reality 等协议对时间敏感，偏差 >30s 会拒绝连接）
 # 返回 0 = 同步OK，1 = 未同步或偏差过大
 check_time_sync() {
-    if ! command -v chronyc >/dev/null 2>&1; then
-        return 1
-    fi
-    if ! systemctl is-active --quiet chrony 2>/dev/null; then
-        return 1
-    fi
-    # 取 System time 偏差（秒），绝对值 > 5 视为异常
     local offset
+    # 容器：时间跟随宿主机，chrony 不可用，直接和网络时间比对
+    if is_container; then
+        offset=$(http_time_offset) || return 1
+        (( offset < 10 ))
+        return
+    fi
+    if ! command -v chronyc >/dev/null 2>&1 || ! systemctl is-active --quiet chrony 2>/dev/null; then
+        # chrony 不可用时退回 HTTP 比对，避免误报
+        offset=$(http_time_offset) || return 1
+        (( offset < 10 ))
+        return
+    fi
     # 行格式: "System time     : 0.000012345 seconds slow of NTP time"，数字是第 3 个字段
     offset=$(chronyc tracking 2>/dev/null | awk -F'[ :]+' '/System time/{print $3}')
-    if [[ -z "$offset" ]]; then
-        return 1
-    fi
-    # bash 不能直接处理浮点，借 awk 比较
     [[ "$offset" =~ ^[0-9.]+$ ]] || return 1
-    if awk -v o="$offset" 'BEGIN{exit !(o+0 < 5)}'; then
-        return 0
-    fi
-    return 1
+    awk -v o="$offset" 'BEGIN{exit !(o+0 < 5)}'
 }
 
 # 一键修复时间同步
 fix_time_sync() {
+    if is_container; then
+        local off
+        off=$(http_time_offset)
+        echo -e "当前 UTC 时间: ${YELLOW}$(date -u)${NC}"
+        if [[ -z "$off" ]]; then
+            warn "无法获取网络时间进行比对（检查网络）"
+        elif (( off < 10 )); then
+            ok "时间正常（与网络时间相差 ${off} 秒）"
+        else
+            err "时间相差 ${off} 秒。这是容器（LXC/OpenVZ），时间由宿主机决定，容器内无法修改"
+            warn "请联系服务商校准宿主机时间"
+        fi
+        return
+    fi
     msg "安装并启用 chrony..."
     apt-get install -y chrony >/dev/null 2>&1
     systemctl enable chrony >/dev/null 2>&1 || true
@@ -186,7 +226,17 @@ menu_time_sync() {
     echo -e "  ${YELLOW}时间不同步会导致客户端连不上、握手失败${NC}"
     hr
     echo -e "  当前 UTC 时间: ${YELLOW}$(date -u)${NC}"
-    if command -v chronyc >/dev/null 2>&1 && systemctl is-active --quiet chrony 2>/dev/null; then
+    if is_container; then
+        echo
+        echo -e "  ${YELLOW}容器环境：时间跟随宿主机，用网络时间比对${NC}"
+        local off; off=$(http_time_offset)
+        echo -e "  与网络时间相差: ${YELLOW}${off:-未知} 秒${NC}"
+        if check_time_sync; then
+            echo -e "  ${GREEN}[√] 时间正常${NC}"
+        else
+            echo -e "  ${RED}[x] 时间偏差过大，需要服务商校准宿主机${NC}"
+        fi
+    elif command -v chronyc >/dev/null 2>&1 && systemctl is-active --quiet chrony 2>/dev/null; then
         echo
         chronyc tracking 2>/dev/null | grep -E 'Reference ID|System time|Last offset|Leap status' | sed 's/^/  /'
         echo
@@ -231,7 +281,13 @@ current_qdisc() {
 enable_bbr() {
     # 内核是否支持 BBR
     if ! modprobe tcp_bbr 2>/dev/null && ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        err "当前内核不支持 BBR (需要 Linux 4.9+)"
+        if is_container; then
+            err "这是容器（LXC/OpenVZ），宿主机没有加载 tcp_bbr 模块，容器里无法自行加载"
+            warn "可用算法: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+            warn "需要服务商在宿主机执行 modprobe tcp_bbr 后才能启用"
+        else
+            err "当前内核不支持 BBR (需要 Linux 4.9+)"
+        fi
         return 1
     fi
     msg "写入 sysctl 配置..."
